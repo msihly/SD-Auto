@@ -1,0 +1,5 @@
+.vscode/todo.md
+build
+env
+node_modules
+package-lock.json
