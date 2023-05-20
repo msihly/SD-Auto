@@ -9,8 +9,10 @@ import {
   generateLoraTrainingFolderAndParams,
   generateTxt2ImgOverrides,
   getActiveModel,
+  getActiveVAE,
   listImageAndParamFileNames,
   listModels,
+  listVAEs,
   mainEmitter,
   pruneFilesFoundInFolders,
   pruneImageParams,
@@ -136,10 +138,26 @@ const SCRIPT_OPTS: {
   },
   {
     action: async () => {
-      listModels(true);
+      await getActiveVAE(true);
+      mainEmitter.emit("done");
+    },
+    label: "Get Active VAE",
+    needsFiles: false,
+  },
+  {
+    action: async () => {
+      await listModels(true);
       mainEmitter.emit("done");
     },
     label: "List Models",
+    needsFiles: false,
+  },
+  {
+    action: async () => {
+      await listVAEs(true);
+      mainEmitter.emit("done");
+    },
+    label: "List VAEs",
     needsFiles: false,
   },
 ];

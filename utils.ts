@@ -1,4 +1,6 @@
 import fs from "fs/promises";
+import { createReadStream } from "fs";
+import { BinaryToTextEncoding, createHash } from "crypto";
 import { createInterface } from "readline";
 import chalk from "chalk";
 import path from "path";
@@ -151,4 +153,31 @@ export const randomSort = <T>(arr: T[]): T[] => {
 export const round = (num: number, decimals = 2) => {
   const n = Math.pow(10, decimals);
   return Math.round((num + Number.EPSILON) * n) / n;
+};
+
+export const sha256File = async (
+  filename: string,
+  {
+    encoding = "hex",
+    length,
+    offset,
+  }: { encoding?: BinaryToTextEncoding; length?: number; offset?: number }
+): Promise<string> => {
+  return new Promise((resolve, reject) => {
+    const fileStream = createReadStream(filename, { highWaterMark: offset });
+    const hash = createHash("sha256");
+
+    fileStream.on("error", reject);
+
+    fileStream.on("end", () => {
+      const digest = hash.digest(encoding);
+      resolve(digest.substring(0, length));
+    });
+
+    fileStream.on("data", (chunk: Buffer) => {
+      hash.update(chunk);
+    });
+
+    fileStream.read(offset);
+  });
 };

@@ -38,3 +38,5 @@ export const REPROD_DIFF_TOLERANCE = env.REPROD_DIFF_TOLERANCE ?? 0.15;
 
 export const TXT2IMG_OVERRIDES_FILE_NAME =
   env.TXT2IMG_OVERRIDES_FILE_NAME ?? "txt2img-overrides.json";
+
+export const VAE_DIR = env.VAE_DIR;

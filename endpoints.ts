@@ -1,7 +1,7 @@
 import fs from "fs/promises";
 import EventEmitter from "events";
-import { performance } from "perf_hooks";
 import path from "path";
+import { performance } from "perf_hooks";
 import axios from "axios";
 import chalk from "chalk";
 import dayjs from "dayjs";
@@ -20,6 +20,7 @@ import {
   OUTPUT_DIR,
   REPROD_DIFF_TOLERANCE,
   TXT2IMG_OVERRIDES_FILE_NAME,
+  VAE_DIR,
 } from "./constants";
 import {
   FileNames,
@@ -43,6 +44,7 @@ import {
   prompt,
   randomSort,
   round,
+  sha256File,
 } from "./utils";
 
 /* -------------------------------------------------------------------------- */
@@ -59,9 +61,14 @@ mainEmitter.on("done", () => {
 /* ----------- Sequential Generation for Upscaling / Reproduction ----------- */
 export class GenerationQueue extends PromiseQueue {
   activeModel: string = null;
+  activeVAEHash: string = null;
 
   getActiveModel() {
     return this.activeModel;
+  }
+
+  getActiveVAEHash() {
+    return this.activeVAEHash;
   }
 
   getOutputDir() {
@@ -71,6 +78,10 @@ export class GenerationQueue extends PromiseQueue {
   setActiveModel(model: string) {
     this.activeModel = model;
   }
+
+  setActiveVAEHash(vae: string) {
+    this.activeVAEHash = vae;
+  }
 }
 
 /* ---------------------------- Get Active Model ---------------------------- */
@@ -78,10 +89,18 @@ export const getActiveModel = async (withConsole = false) => {
   const config = (await axios({ method: "GET", url: `${API_URL}/options` }))?.data;
   const model = (config?.sd_model_checkpoint as string)
     .replace(/\\/gi, "_")
-    .replace(/(\.(checkpoint|safetensors))|(\[.+\]$)/gi, "")
+    .replace(/(\.(ckpt|checkpoint|safetensors))|(\[.+\]$)/gi, "")
     .trim();
   if (withConsole) console.log("Active model: ", chalk.cyan(model));
   return model;
+};
+
+/* ---------------------------- Get Active VAE ---------------------------- */
+export const getActiveVAE = async (withConsole = false) => {
+  const config = (await axios({ method: "GET", url: `${API_URL}/options` }))?.data;
+  const vae = (config?.sd_vae as string).trim();
+  if (withConsole) console.log("Active VAE: ", chalk.cyan(vae));
+  return vae;
 };
 
 /* -------------- Get Image and Generatiom Parameter File Names ------------- */
@@ -138,6 +157,39 @@ export const listSamplers = async (withConsole = false) => {
   ) as string[];
   if (withConsole) console.log(`Samplers:\n${chalk.cyan(makeConsoleList(samplers))}`);
   return samplers;
+};
+
+/* -------------------------------- List VAEs ------------------------------- */
+/**
+ * Uses hashing algorithm used internally by Automatic1111.
+ * @see [Line 138 of /modules/sd_models in related commit](https://github.dev/liamkerr/stable-diffusion-webui/blob/66cad3ab6f1a06a15b7302d1788a1574dd08ce86/modules/sd_models.py#L132)
+ */
+export const listVAEs = async (withConsole = false) => {
+  const vaes = await Promise.all(
+    (
+      await dirToFilePaths(VAE_DIR)
+    )
+      .filter((filePath) => /ckpt|safetensors/im.test(filePath))
+      .map(async (filePath) => ({
+        fileName: path.basename(filePath),
+        hash: await sha256File(filePath, { length: 10, offset: 0x100000 }),
+      }))
+  );
+
+  if (withConsole)
+    console.log(
+      `VAEs:\n${chalk.cyan(
+        makeConsoleList(
+          vaes.map(
+            (v) =>
+              `${chalk.blueBright("Filename:")} ${v.fileName}. ${chalk.blueBright("Hash:")} ${
+                v.hash
+              }.`
+          )
+        )
+      )}`
+    );
+  return vaes;
 };
 
 /* ---------------------- List Upscalers ---------------------- */
@@ -207,7 +259,8 @@ export const parseImageParam = <IsNum extends boolean>(
   paramName: string,
   isNumber: IsNum,
   optional = false,
-  endDelimiter = ","
+  endDelimiter = ",",
+  startDelimeter = ": "
 ): IsNum extends true ? number : string => {
   try {
     const hasParam = imageParams.includes(`${paramName}: `);
@@ -217,10 +270,12 @@ export const parseImageParam = <IsNum extends boolean>(
       return undefined;
     }
 
-    const rawParamUnterminated = imageParams.substring(imageParams.indexOf(`${paramName}: `));
-    const startIndex = rawParamUnterminated.indexOf(": ") + 2;
-    let endIndex = rawParamUnterminated.indexOf(endDelimiter);
-    if (!(rawParamUnterminated.indexOf(endDelimiter) > 0)) endIndex = undefined;
+    const rawParamUnterminated = imageParams.substring(
+      imageParams.indexOf(`${paramName}${startDelimeter}`)
+    );
+    const startIndex = rawParamUnterminated.indexOf(startDelimeter) + startDelimeter.length;
+    let endIndex = rawParamUnterminated.indexOf(endDelimiter, startIndex);
+    if (!(endIndex > 0)) endIndex = undefined;
 
     const value = rawParamUnterminated
       .substring(startIndex, endIndex)
@@ -283,6 +338,7 @@ export const parseImageParams = async ({
   const subseedStrength =
     overrides?.subseedStrength ??
     parseImageParam(restParams, "Variation seed strength", true, true);
+  const vaeHash = overrides?.vae ?? parseImageParam(restParams, '"vae"', false, true, '"', ': "');
   const [width, height] = parseImageParam(restParams, "Size", false)
     .split("x")
     .map((d) => +d);
@@ -351,6 +407,7 @@ export const parseImageParams = async ({
     subseedStrength,
     template,
     width,
+    vaeHash,
   };
 };
 
@@ -371,7 +428,12 @@ export const parseAndSortImageParams = async ({ imageFileNames, paramFileNames }
     await Promise.all(
       paramFileNames.map((paramFileName) => parseImageParams({ modelNames, paramFileName }))
     )
-  ).sort((a, b) => a.model.localeCompare(b.model));
+  ).sort((a, b) => {
+    if (a.vaeHash && !b.vaeHash) return -1;
+    if (!a.vaeHash && b.vaeHash) return 1;
+    if (a.vaeHash && b.vaeHash) return a.vaeHash.localeCompare(b.vaeHash);
+    return a.model.localeCompare(b.model);
+  });
 
   console.log(chalk.green("Image params parsed and sorted."));
   return allImageParams;
@@ -438,6 +500,31 @@ export const setActiveModel = async (modelName: string) => {
   });
 
   if (res.status !== 200) throw new Error(`Failed to set active model to ${modelName}.`);
+};
+
+/* ---------------------------- Set Active VAE ---------------------------- */
+/** Current bug with setting VAE that requires switching to another VAE or checkpoint before switching to desired VAE, otherwise will not take effect. */
+export const setActiveVAE = async (vaeName: "None" | "Automatic" | string) => {
+  let res = await axios({
+    method: "POST",
+    url: `${API_URL}/options`,
+    data: { sd_vae: vaeName },
+  });
+  if (res.status !== 200) throw new Error(`Failed to set active VAE to ${vaeName}.`);
+
+  res = await axios({
+    method: "POST",
+    url: `${API_URL}/options`,
+    data: { sd_vae: "None" },
+  });
+  if (res.status !== 200) throw new Error(`Failed to set active VAE to ${vaeName}.`);
+
+  res = await axios({
+    method: "POST",
+    url: `${API_URL}/options`,
+    data: { sd_vae: vaeName },
+  });
+  if (res.status !== 200) throw new Error(`Failed to set active VAE to ${vaeName}.`);
 };
 
 /* -------------------------------------------------------------------------- */
@@ -589,6 +676,12 @@ export const generateTxt2ImgOverrides = async () => {
   await numericalPrompt("Enter Subseed Strength: ", "subseedStrength");
   const upscalers = await listUpscalers();
   await numListPrompt("Upscaler", "upscaler", upscalers);
+  const vaes = await listVAEs();
+  await numListPrompt(
+    "VAE",
+    "vae",
+    vaes.map((v) => v.fileName)
+  );
 
   const overridesJson = JSON.stringify(overrides, null, 2);
   await fs.writeFile(TXT2IMG_OVERRIDES_FILE_NAME, overridesJson);
@@ -763,13 +856,16 @@ export const generateImages = async ({
     const perfStart = performance.now();
 
     await refreshModels();
-    const [activeModel, allImageParams, modelNames] = await Promise.all([
+    const [activeModel, activeVAEHash, allImageParams, modelNames, vaes] = await Promise.all([
       getActiveModel(),
+      getActiveVAE(),
       parseAndSortImageParams({ imageFileNames, paramFileNames }),
       listModels(),
+      listVAEs(),
     ]);
 
     GenQueue.setActiveModel(activeModel);
+    GenQueue.setActiveVAEHash(activeVAEHash);
 
     let completedCount = 0;
     const totalCount = allImageParams.length;
@@ -843,11 +939,33 @@ export const generateImages = async ({
             await setActiveModel(imageParams.model);
             GenQueue.setActiveModel(imageParams.model);
 
-            console.log(
-              chalk.green("Active model updated."),
-              `Beginning ${mode === "upscale" ? "upscale" : "reproduction"}...`
-            );
+            console.log(chalk.green("Active model updated."));
           }
+
+          if (imageParams.vaeHash !== GenQueue.getActiveVAEHash()) {
+            const vae = vaes.find((v) => v.hash === imageParams.vaeHash);
+            if (!vae) {
+              console.warn(
+                chalk.yellow(
+                  `VAE with hash ${chalk.magenta(
+                    imageParams.vaeHash
+                  )} does not exist. Setting active VAE to ${chalk.magenta("Automatic")}...`
+                )
+              );
+
+              await setActiveVAE("Automatic");
+              GenQueue.setActiveVAEHash("Automatic");
+            } else {
+              console.log(
+                `Setting active VAE to ${chalk.magenta(`${vae.fileName} (${vae.hash})`)}...`
+              );
+              GenQueue.setActiveVAEHash(vae.hash);
+            }
+
+            console.log(chalk.green("Active VAE updated."));
+          }
+
+          console.log(`Beginning ${mode === "upscale" ? "upscale" : "reproduction"}...`);
 
           const res = (
             await axios({

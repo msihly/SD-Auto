@@ -80,4 +80,5 @@ export type Txt2ImgOverrides = {
   subseedStrength?: number;
   upscaler?: string;
   template?: string;
+  vae?: string;
 };
