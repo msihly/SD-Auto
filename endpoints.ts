@@ -39,6 +39,7 @@ import {
   convertImagesToJPG,
   delimit,
   dirToFilePaths,
+  doesPathExist,
   escapeRegEx,
   getImagesInFolders,
   makeConsoleList,
@@ -789,14 +790,51 @@ export const pruneImageParams = async ({
   if (!noEmit) mainEmitter.emit("done");
 };
 
+/* --------------- Initialize Automatic1111 Folders (Symlinks) -------------- */
+export const initAutomatic1111Folders = async () => {
+  const promptForPath = async (question: string) =>
+    (await prompt(chalk.blueBright(question))).replace(/\"|^(\r|\s)|(\r|\s)$/gim, "");
+
+  try {
+    const rootDir = await fs.realpath(".");
+    console.log("Root Automatic1111 folder path: ", chalk.cyan(rootDir));
+
+    const promptForSymlink = async (targetDirName: string, sourceDir: string) => {
+      const folder = await promptForPath(`Enter path of external ${chalk.magenta(targetDirName)} folder: `);
+      if (!folder.length) console.warn(chalk.yellow(`Not linking ${chalk.magenta(targetDirName)} folder.`));
+      else {
+        const hasSourceDir = await doesPathExist(sourceDir);
+        if (hasSourceDir) await fs.rename(sourceDir, `${sourceDir} (OLD)`);
+
+        await fs.symlink(folder, path.join(rootDir, sourceDir), "junction");
+        console.log(chalk.green(`${targetDirName} folder linked.`));
+      }
+    };
+
+    await promptForSymlink("Embeddings", "embeddings");
+    await promptForSymlink("Extensions", "extensions");
+    await promptForSymlink("Lora", "models\\Lora");
+    await promptForSymlink("LyCORIS / LoCon / LoHa", "models\\LyCORIS");
+    await promptForSymlink("Models", "models\\Stable-diffusion");
+    await promptForSymlink("Outputs", "outputs");
+    await promptForSymlink("VAE", "models\\VAE");
+    await promptForSymlink("ControlNet Poses", "models\\ControlNet");
+  } catch (err) {
+    console.error(chalk.red(err));
+  } finally {
+    mainEmitter.emit("done");
+  }
+};
+
 /* ------------ Prune Generation Parameters & Segment by Upscaled ----------- */
 export const pruneParamsAndSegmentUpscaled = async (fileNames: FileNames) => {
   try {
     await pruneImageParams({ ...fileNames, noEmit: true });
     await segmentByUpscaled({ ...fileNames, noEmit: true });
-    mainEmitter.emit("done");
   } catch (err) {
     console.error(chalk.red(err));
+  } finally {
+    mainEmitter.emit("done");
   }
 };
 

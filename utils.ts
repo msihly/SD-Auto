@@ -86,6 +86,15 @@ export const dirToFilePaths = async (dirPath: string): Promise<string[]> => {
   ).flat();
 };
 
+export const doesPathExist = async (fileOrDirPath: string) => {
+  try {
+    await fs.access(fileOrDirPath);
+    return true;
+  } catch (err) {
+    return false;
+  }
+};
+
 export const escapeRegEx = (str: string) => str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 export const getImagesInFolders = async ({

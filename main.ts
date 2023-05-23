@@ -10,6 +10,7 @@ import {
   generateTxt2ImgOverrides,
   getActiveModel,
   getActiveVAE,
+  initAutomatic1111Folders,
   listImageAndParamFileNames,
   listModels,
   listVAEs,
@@ -158,6 +159,11 @@ const SCRIPT_OPTS: {
       mainEmitter.emit("done");
     },
     label: "List VAEs",
+    needsFiles: false,
+  },
+  {
+    action: initAutomatic1111Folders,
+    label: "Initialize Automatic1111 Folders (Symlinks)",
     needsFiles: false,
   },
 ];
