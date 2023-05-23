@@ -26,6 +26,7 @@ import {
   FileNames,
   ImageFileNames,
   LoraTrainingParams,
+  Model,
   NoEmit,
   ParamFileNames,
   Txt2ImgOverrides,
@@ -142,9 +143,10 @@ export const listImageAndParamFileNames = async (withRecursiveFiles = false) => 
 /* ---------------------- List Models ---------------------- */
 export const listModels = async (withConsole = false) => {
   const models = (await axios({ method: "GET", url: `${API_URL}/sd-models` }))?.data?.map((m) => ({
+    hash: m.hash,
     name: m.model_name.replace(/,|^(\n|\r|\s)|(\n|\r|\s)$/gim, ""),
     path: m.filename,
-  })) as { name: string; path: string }[];
+  })) as { hash: string; name: string; path: string }[];
   if (withConsole)
     console.log(`Models:\n${chalk.cyan(makeConsoleList(models.map((m) => m.name)))}`);
   return models;
@@ -292,10 +294,10 @@ export const parseImageParam = <IsNum extends boolean>(
 
 /* ----------------- Parse Image Generation Parameters File ----------------- */
 export const parseImageParams = async ({
-  modelNames,
+  models,
   paramFileName,
 }: {
-  modelNames: string[];
+  models: Model[];
   paramFileName: string;
 }) => {
   const [imageParams, overrides] = await Promise.all([
@@ -314,7 +316,9 @@ export const parseImageParams = async ({
   const restParams = imageParams.substring(negPromptEndIndex);
 
   const rawModelName = overrides?.model ?? parseImageParam(restParams, "Model", false);
-  let model = remapModelName(modelNames, rawModelName);
+  const modelHash = parseImageParam(restParams, "Model hash", false);
+
+  let model = remapModelName(models, modelHash);
   if (!model) {
     model = rawModelName;
     console.log(
@@ -338,7 +342,8 @@ export const parseImageParams = async ({
   const subseedStrength =
     overrides?.subseedStrength ??
     parseImageParam(restParams, "Variation seed strength", true, true);
-  const vaeHash = overrides?.vae ?? parseImageParam(restParams, '"vae"', false, true, '"', ': "');
+  const vaeHash =
+    overrides?.vae ?? parseImageParam(restParams, '"vae"', false, true, '"', ': "') ?? "None";
   const [width, height] = parseImageParam(restParams, "Size", false)
     .split("x")
     .map((d) => +d);
@@ -423,10 +428,10 @@ export const parseAndSortImageParams = async ({ imageFileNames, paramFileNames }
   }
 
   console.log("Parsing and sorting image params...");
-  const modelNames = (await listModels()).map((m) => m.name);
+  const models = await listModels();
   const allImageParams = (
     await Promise.all(
-      paramFileNames.map((paramFileName) => parseImageParams({ modelNames, paramFileName }))
+      paramFileNames.map((paramFileName) => parseImageParams({ models, paramFileName }))
     )
   ).sort((a, b) => {
     if (a.vaeHash && !b.vaeHash) return -1;
@@ -441,6 +446,8 @@ export const parseAndSortImageParams = async ({ imageFileNames, paramFileNames }
 
 /* ----------------------- Prompt For Batch Generation Parameters ---------------------- */
 export const promptForBatchParams = async ({ imageFileNames }: ImageFileNames) => {
+  const folderName = await prompt(chalk.blueBright(`Enter folder name: `));
+
   let excludedPaths = delimit(
     await prompt(
       chalk.blueBright(
@@ -477,12 +484,12 @@ export const promptForBatchParams = async ({ imageFileNames }: ImageFileNames) =
         )
       : imageFileNames;
 
-  return { batchSize, filesNotInOtherFolders };
+  return { batchSize, filesNotInOtherFolders, folderName };
 };
 
 /* ---------------------------- Remap Model Name ---------------------------- */
-export const remapModelName = (modelNames: string[], modelName: string) =>
-  modelNames.find((name) => name.includes(modelName));
+export const remapModelName = (models: { hash: string; name: string }[], modelHash: string) =>
+  models.find((m) => m.hash === modelHash)?.name;
 
 /* ----------------------------- Refresh Models ----------------------------- */
 export const refreshModels = async () => {
@@ -557,14 +564,11 @@ export const generateBatch = async ({ imageFileNames, noEmit }: ImageFileNames &
   await Promise.all(
     filesToCopy
       .map(async (imageFileName) => {
-        await Promise.all(
-          ["jpg", "txt"].map((ext) => {
-            const fileName = `${imageFileName}.${ext}`;
+        const fileName = `${imageFileName}.jpg`;
+
             fs.copyFile(fileName, path.join(targetPath, fileName)).catch((err) =>
               console.error(chalk.red(err))
             );
-          })
-        );
 
         console.log(`Moved ${chalk.cyan(imageFileName)} to ${chalk.magenta(targetPath)}.`);
       })
@@ -580,47 +584,36 @@ export const generateBatch = async ({ imageFileNames, noEmit }: ImageFileNames &
 /* ----------------------------- Generate Batches (Exhaustive) ----------------------------- */
 export const generateBatchesExhaustive = async ({
   imageFileNames,
-  paramFileNames,
   shuffle = false,
   noEmit,
-}: FileNames & NoEmit & { shuffle?: boolean }) => {
-  const { batchSize, filesNotInOtherFolders } = await promptForBatchParams({ imageFileNames });
+}: ImageFileNames & NoEmit & { shuffle?: boolean }) => {
+  const { batchSize, filesNotInOtherFolders, folderName } = await promptForBatchParams({
+    imageFileNames,
+  });
 
   const batches = chunkArray(
     shuffle ? randomSort(filesNotInOtherFolders) : filesNotInOtherFolders,
     batchSize
   ).map((batch, i) => ({
     fileNames: batch,
-    folderName: `Batch - ${i + 1} [${batch.length}]`,
+    folderName: `[Batch] ${folderName} - ${i + 1} (${batch.length})`,
   }));
 
   await Promise.all(
-    batches
-      .map(async (batch) => {
+    batches.map(async (batch) => {
         await fs.mkdir(batch.folderName, { recursive: true });
 
         await Promise.all(
-          batch.fileNames.map(async (fileName) => {
-            await Promise.all(
-              ["jpg", "txt"].map(async (ext) => {
+        batch.fileNames.map(async (name) => {
                 try {
-                  if (ext === "txt" && !paramFileNames.find((p) => p === fileName)) {
-                    console.log(
-                      chalk.yellow(`Generation parameters file not found for ${fileName}.`)
-                    );
-                  } else {
-                    const name = `${fileName}.${ext}`;
-                    await fs.copyFile(name, path.join(batch.folderName, path.basename(name)));
-                  }
+            const fileName = `${name}.jpg`;
+            await fs.copyFile(fileName, path.join(batch.folderName, path.basename(fileName)));
+            console.log(`Moved ${chalk.cyan(name)} to ${chalk.magenta(batch.folderName)}.`);
                 } catch (err) {
                   console.error(chalk.red(err));
                 }
               })
             );
-
-            console.log(`Moved ${chalk.cyan(fileName)} to ${chalk.magenta(batch.folderName)}.`);
-          })
-        );
 
         console.log(
           chalk.green(
@@ -630,7 +623,6 @@ export const generateBatchesExhaustive = async ({
           )
         );
       })
-      .flat()
   );
 
   if (!noEmit) mainEmitter.emit("done");
@@ -677,11 +669,7 @@ export const generateTxt2ImgOverrides = async () => {
   const upscalers = await listUpscalers();
   await numListPrompt("Upscaler", "upscaler", upscalers);
   const vaes = await listVAEs();
-  await numListPrompt(
-    "VAE",
-    "vae",
-    vaes.map((v) => v.fileName)
-  );
+  await numListPrompt("VAE", "vae", ["None", "Automatic"].concat(vaes.map((v) => v.fileName)));
 
   const overridesJson = JSON.stringify(overrides, null, 2);
   await fs.writeFile(TXT2IMG_OVERRIDES_FILE_NAME, overridesJson);
@@ -942,24 +930,35 @@ export const generateImages = async ({
             console.log(chalk.green("Active model updated."));
           }
 
-          if (imageParams.vaeHash !== GenQueue.getActiveVAEHash()) {
+          const activeVAEHash = GenQueue.getActiveVAEHash();
+          if (imageParams.vaeHash !== activeVAEHash) {
+            if (
+              ["Automatic", "None"].includes(imageParams.vaeHash) &&
+              !["Automatic", "None"].includes(activeVAEHash)
+            ) {
+              console.log(`Setting active VAE to ${chalk.magenta(imageParams.vaeHash)}...`);
+              await setActiveVAE(imageParams.vaeHash);
+              GenQueue.setActiveVAEHash(imageParams.vaeHash);
+            } else {
             const vae = vaes.find((v) => v.hash === imageParams.vaeHash);
             if (!vae) {
               console.warn(
                 chalk.yellow(
                   `VAE with hash ${chalk.magenta(
                     imageParams.vaeHash
-                  )} does not exist. Setting active VAE to ${chalk.magenta("Automatic")}...`
+                    )} does not exist. Setting active VAE to ${chalk.magenta("None")}...`
                 )
               );
 
-              await setActiveVAE("Automatic");
-              GenQueue.setActiveVAEHash("Automatic");
+                await setActiveVAE("None");
+                GenQueue.setActiveVAEHash("None");
             } else {
               console.log(
                 `Setting active VAE to ${chalk.magenta(`${vae.fileName} (${vae.hash})`)}...`
               );
+                await setActiveVAE(vae.fileName);
               GenQueue.setActiveVAEHash(vae.hash);
+              }
             }
 
             console.log(chalk.green("Active VAE updated."));

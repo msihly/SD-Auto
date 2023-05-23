@@ -56,6 +56,8 @@ export type LoraTrainingParams = {
   xformers?: boolean;
 };
 
+export type Model = { hash: string; name: string };
+
 export type NoEmit = { noEmit?: boolean };
 
 export type Txt2ImgOverrides = {
