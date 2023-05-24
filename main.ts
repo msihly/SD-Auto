@@ -18,6 +18,7 @@ import {
   pruneFilesFoundInFolders,
   pruneImageParams,
   pruneParamsAndSegmentUpscaled,
+  segmentByDimensions,
   segmentByKeywords,
   segmentByModel,
   segmentByUpscaled,
@@ -101,6 +102,11 @@ const SCRIPT_OPTS: {
   {
     action: segmentByModel,
     label: "Segment by Model",
+    needsFiles: true,
+  },
+  {
+    action: segmentByDimensions,
+    label: "Segment by Dimensions",
     needsFiles: true,
   },
   {

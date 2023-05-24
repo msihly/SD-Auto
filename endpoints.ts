@@ -5,6 +5,7 @@ import { performance } from "perf_hooks";
 import axios from "axios";
 import chalk from "chalk";
 import dayjs from "dayjs";
+import sharp from "sharp";
 import { main } from "./main";
 import {
   API_URL,
@@ -141,6 +142,31 @@ export const listImageAndParamFileNames = async (withRecursiveFiles = false) => 
   return { imageFileNames, paramFileNames };
 };
 
+/* ---------------------- List Images Found In Other Folders --------------------- */
+export const listImagesFoundInOtherFolders = ({
+  imageFileNames,
+  imagesInOtherFolders,
+  withConsole = false,
+}: ImageFileNames & { imagesInOtherFolders: Image[]; withConsole?: boolean }) => {
+  const images = imageFileNames.reduce((acc, cur) => {
+    const imageInOtherFolder = imagesInOtherFolders.find((img) => img.name === cur);
+    if (!imageInOtherFolder) return acc;
+    else acc.push(imageInOtherFolder);
+    return acc;
+  }, [] as Image[]);
+
+  if (withConsole)
+    console.log(
+      `Images in current folder and other folders:\n${chalk.cyan(
+        makeConsoleList(
+          images.map((img) => `Name: ${img.name}. Hash: ${img.hashMD5}. Path: ${img.path}.`)
+        )
+      )}`
+    );
+
+  return images;
+};
+
 /* ---------------------- List Models ---------------------- */
 export const listModels = async (withConsole = false) => {
   const models = (await axios({ method: "GET", url: `${API_URL}/sd-models` }))?.data?.map((m) => ({
@@ -160,6 +186,15 @@ export const listSamplers = async (withConsole = false) => {
   ) as string[];
   if (withConsole) console.log(`Samplers:\n${chalk.cyan(makeConsoleList(samplers))}`);
   return samplers;
+};
+
+/* ---------------------- List Upscalers ---------------------- */
+export const listUpscalers = async (withConsole = false) => {
+  const upscalers = (await axios({ method: "GET", url: `${API_URL}/upscalers` }))?.data?.map(
+    (s) => s.name
+  ) as string[];
+  if (withConsole) console.log(`Upscalers:\n${chalk.cyan(makeConsoleList(upscalers))}`);
+  return upscalers;
 };
 
 /* -------------------------------- List VAEs ------------------------------- */
@@ -193,40 +228,6 @@ export const listVAEs = async (withConsole = false) => {
       )}`
     );
   return vaes;
-};
-
-/* ---------------------- List Upscalers ---------------------- */
-export const listUpscalers = async (withConsole = false) => {
-  const upscalers = (await axios({ method: "GET", url: `${API_URL}/upscalers` }))?.data?.map(
-    (s) => s.name
-  ) as string[];
-  if (withConsole) console.log(`Upscalers:\n${chalk.cyan(makeConsoleList(upscalers))}`);
-  return upscalers;
-};
-
-/* ---------------------- List Images Found In Other Folders --------------------- */
-export const listImagesFoundInOtherFolders = ({
-  imageFileNames,
-  imagesInOtherFolders,
-  withConsole = false,
-}: ImageFileNames & { imagesInOtherFolders: Image[]; withConsole?: boolean }) => {
-  const images = imageFileNames.reduce((acc, cur) => {
-    const imageInOtherFolder = imagesInOtherFolders.find((img) => img.name === cur);
-    if (!imageInOtherFolder) return acc;
-    else acc.push(imageInOtherFolder);
-    return acc;
-  }, [] as Image[]);
-
-  if (withConsole)
-    console.log(
-      `Images in current folder and other folders:\n${chalk.cyan(
-        makeConsoleList(
-          images.map((img) => `Name: ${img.name}. Hash: ${img.hashMD5}. Path: ${img.path}.`)
-        )
-      )}`
-    );
-
-  return images;
 };
 
 /* --------------------- Load Txt2Img Generation Overrides From File --------------------- */
@@ -567,9 +568,9 @@ export const generateBatch = async ({ imageFileNames, noEmit }: ImageFileNames &
       .map(async (imageFileName) => {
         const fileName = `${imageFileName}.jpg`;
 
-            fs.copyFile(fileName, path.join(targetPath, fileName)).catch((err) =>
-              console.error(chalk.red(err))
-            );
+        fs.copyFile(fileName, path.join(targetPath, fileName)).catch((err) =>
+          console.error(chalk.red(err))
+        );
 
         console.log(`Moved ${chalk.cyan(imageFileName)} to ${chalk.magenta(targetPath)}.`);
       })
@@ -602,271 +603,30 @@ export const generateBatchesExhaustive = async ({
 
   await Promise.all(
     batches.map(async (batch) => {
-        await fs.mkdir(batch.folderName, { recursive: true });
+      await fs.mkdir(batch.folderName, { recursive: true });
 
-        await Promise.all(
+      await Promise.all(
         batch.fileNames.map(async (name) => {
-                try {
+          try {
             const fileName = `${name}.jpg`;
             await fs.copyFile(fileName, path.join(batch.folderName, path.basename(fileName)));
             console.log(`Moved ${chalk.cyan(name)} to ${chalk.magenta(batch.folderName)}.`);
-                } catch (err) {
-                  console.error(chalk.red(err));
-                }
-              })
-            );
-
-        console.log(
-          chalk.green(
-            `New batch of size ${chalk.cyan(batch.fileNames.length)} created at ${chalk.cyan(
-              batch.folderName
-            )}.`
-          )
-        );
-      })
-  );
-
-  if (!noEmit) mainEmitter.emit("done");
-};
-
-/* ---------------------- Generate Txt2Img Overrides ---------------------- */
-export const generateTxt2ImgOverrides = async () => {
-  const overrides: Txt2ImgOverrides = {};
-
-  const booleanPrompt = async (question: string, optName: string) => {
-    const res = (await prompt(chalk.blueBright(`${question} (y/n): `))) as "y" | "n";
-    if (res === "y" || res === "n") overrides[optName] = res === "y";
-  };
-
-  const numListPrompt = async (label: string, optName: string, options: string[]) => {
-    const index = +(await prompt(
-      `${chalk.blueBright(`Enter ${label} (1 - ${options.length}):`)}\n${makeConsoleList(
-        options,
-        true
-      )}\n`
-    ));
-
-    if (index > 0 && index <= options.length) overrides[optName] = options[index - 1];
-  };
-
-  const numericalPrompt = async (question: string, optName: string) => {
-    const res = await prompt(chalk.blueBright(question));
-    if (res.length > 0 && !isNaN(+res)) overrides[optName] = +res;
-  };
-
-  await numericalPrompt("Enter CFG Scale: ", "cfgScale");
-  await numericalPrompt("Enter Clip Skip: ", "clipSkip");
-  await numericalPrompt("Enter Denoising Strength: ", "denoisingStrength");
-  await numericalPrompt("Enter Hires Scale: ", "hiresScale");
-  const models = (await listModels()).map((m) => m.name);
-  await numListPrompt("Model", "model", models);
-  await booleanPrompt("Restore Faces?", "restoreFaces");
-  const samplers = await listSamplers();
-  await numListPrompt("Sampler", "sampler", samplers);
-  await numericalPrompt("Enter Seed: ", "seed");
-  await numericalPrompt("Enter Steps: ", "steps");
-  await numericalPrompt("Enter Subseed: ", "subseed");
-  await numericalPrompt("Enter Subseed Strength: ", "subseedStrength");
-  const upscalers = await listUpscalers();
-  await numListPrompt("Upscaler", "upscaler", upscalers);
-  const vaes = await listVAEs();
-  await numListPrompt("VAE", "vae", ["None", "Automatic"].concat(vaes.map((v) => v.fileName)));
-
-  const overridesJson = JSON.stringify(overrides, null, 2);
-  await fs.writeFile(TXT2IMG_OVERRIDES_FILE_NAME, overridesJson);
-
-  console.log(chalk.green(`Created ${TXT2IMG_OVERRIDES_FILE_NAME}:`), chalk.cyan(overridesJson));
-  mainEmitter.emit("done");
-};
-
-/* ---------------- Generate Lora Training Folder and Params ---------------- */
-export const generateLoraTrainingFolderAndParams = async () => {
-  const trainingParams = await loadLoraTrainingParams(DEFAULT_LORA_PARAMS_PATH);
-
-  const curDirName = path.basename(await fs.realpath("."));
-  const loraName =
-    (await prompt(`Enter Lora name ${chalk.grey(`(${curDirName})`)}: `)) || curDirName;
-  trainingParams.output_name = loraName;
-
-  const modelList = await listModels(true);
-  const modelIndex = +(await prompt(
-    `${chalk.blueBright(
-      `Enter model to train on (1 - ${modelList.length}) ${chalk.grey(`(${DEFAULT_LORA_MODEL})`)}:`
-    )}\n${makeConsoleList(
-      modelList.map((m) => m.name),
-      true
-    )}\n`
-  ));
-  trainingParams.pretrained_model_name_or_path =
-    modelIndex > 0 && modelIndex <= modelList.length
-      ? modelList[modelIndex - 1].path
-      : DEFAULT_LORA_MODEL;
-
-  const { imageFileNames } = await listImageAndParamFileNames();
-
-  const imagesDirName = `input\\${Math.max(100, 1500 / imageFileNames.length)}_${loraName}`;
-  await Promise.all(
-    [imagesDirName, "logs", "output"].map((dirName) => fs.mkdir(dirName, { recursive: true }))
-  );
-
-  trainingParams.logging_dir = path.resolve("logs");
-  trainingParams.output_dir = path.resolve("output");
-  trainingParams.train_data_dir = path.resolve("input");
-
-  await Promise.all(
-    imageFileNames.map((fileName) =>
-      fs.rename(`${fileName}.jpg`, path.join(imagesDirName, `${fileName}.jpg`))
-    )
-  );
-  console.log(
-    `Moved ${chalk.cyan(imageFileNames.length)} images to ${chalk.magenta(imagesDirName)}.`
-  );
-
-  const trainingParamsJson = JSON.stringify(trainingParams, null, 2);
-  await fs.writeFile(LORA_TRAINING_PARAMS_FILE_NAME, trainingParamsJson);
-
-  console.log(
-    chalk.green(`Created ${LORA_TRAINING_PARAMS_FILE_NAME}:`),
-    chalk.cyan(trainingParamsJson)
-  );
-  mainEmitter.emit("done");
-};
-
-/* ------------------- Prune Files Found in Other Folders ------------------- */
-export const pruneFilesFoundInFolders = async ({
-  imageFileNames,
-  noEmit,
-}: ImageFileNames & NoEmit) => {
-  const otherPaths = (await prompt(chalk.blueBright("Enter folder paths to exclude: ")))
-    .replace(/^(,|\s)|(,|\s)$/g, "")
-    .split("|")
-    .map((p) => p.trim());
-
-  const imagesInOtherFolders = await getImagesInFolders({ paths: otherPaths });
-
-  const imagesInCurFolderAndOtherFolders = listImagesFoundInOtherFolders({
-    imageFileNames,
-    imagesInOtherFolders,
-  });
-
-  const targetDir = DIR_NAMES.prunedImagesOtherFolders;
-  await fs.mkdir(targetDir, { recursive: true });
-
-  await Promise.all(
-    imagesInCurFolderAndOtherFolders.map(async (img) => {
-      const fileName = `${img.name}.${img.ext}`;
-      await fs.rename(fileName, path.join(targetDir, fileName));
-      console.log(`Pruned ${chalk.yellow(fileName)}.`);
-    })
-  );
-
-  console.log(chalk.green("All images found in other folders pruned."));
-  if (!noEmit) mainEmitter.emit("done");
-};
-
-/* ------------------- Prune Generation Parameters ------------------- */
-export const pruneImageParams = async ({
-  noEmit,
-  imageFileNames,
-  paramFileNames,
-}: FileNames & NoEmit) => {
-  let unusedParamsCount = 0;
-  const dirName = DIR_NAMES.prunedParams;
-  await fs.mkdir(dirName, { recursive: true });
-
-  await Promise.all(
-    paramFileNames.map(async (p) => {
-      const image = imageFileNames.find((i) => i === p);
-      if (!image) {
-        const fileName = `${p}.txt`;
-        await fs.rename(fileName, path.join(dirName, path.basename(fileName)));
-        unusedParamsCount++;
-        console.log(chalk.yellow(`${fileName} pruned.`));
-      }
-    })
-  );
-
-  console.log(`${chalk.yellow(unusedParamsCount)} unused params pruned.`);
-  if (!noEmit) mainEmitter.emit("done");
-};
-
-/* --------------- Initialize Automatic1111 Folders (Symlinks) -------------- */
-export const initAutomatic1111Folders = async () => {
-  const promptForPath = async (question: string) =>
-    (await prompt(chalk.blueBright(question))).replace(/\"|^(\r|\s)|(\r|\s)$/gim, "");
-
-  try {
-    const rootDir = await fs.realpath(".");
-    console.log("Root Automatic1111 folder path: ", chalk.cyan(rootDir));
-
-    const promptForSymlink = async (targetDirName: string, sourceDir: string) => {
-      const folder = await promptForPath(`Enter path of external ${chalk.magenta(targetDirName)} folder: `);
-      if (!folder.length) console.warn(chalk.yellow(`Not linking ${chalk.magenta(targetDirName)} folder.`));
-      else {
-        const hasSourceDir = await doesPathExist(sourceDir);
-        if (hasSourceDir) await fs.rename(sourceDir, `${sourceDir} (OLD)`);
-
-        await fs.symlink(folder, path.join(rootDir, sourceDir), "junction");
-        console.log(chalk.green(`${targetDirName} folder linked.`));
-      }
-    };
-
-    await promptForSymlink("Embeddings", "embeddings");
-    await promptForSymlink("Extensions", "extensions");
-    await promptForSymlink("Lora", "models\\Lora");
-    await promptForSymlink("LyCORIS / LoCon / LoHa", "models\\LyCORIS");
-    await promptForSymlink("Models", "models\\Stable-diffusion");
-    await promptForSymlink("Outputs", "outputs");
-    await promptForSymlink("VAE", "models\\VAE");
-    await promptForSymlink("ControlNet Poses", "models\\ControlNet");
-  } catch (err) {
-    console.error(chalk.red(err));
-  } finally {
-    mainEmitter.emit("done");
-  }
-};
-
-/* ------------ Prune Generation Parameters & Segment by Upscaled ----------- */
-export const pruneParamsAndSegmentUpscaled = async (fileNames: FileNames) => {
-  try {
-    await pruneImageParams({ ...fileNames, noEmit: true });
-    await segmentByUpscaled({ ...fileNames, noEmit: true });
-  } catch (err) {
-    console.error(chalk.red(err));
-  } finally {
-    mainEmitter.emit("done");
-  }
-};
-
-/* ---------------------------- Segment by Model ---------------------------- */
-export const segmentByModel = async ({
-  imageFileNames,
-  paramFileNames,
-  noEmit,
-}: FileNames & NoEmit) => {
-  console.log("Segmenting by model...");
-
-  const allImageParams = await parseAndSortImageParams({ imageFileNames, paramFileNames });
-
-  await Promise.all(
-    allImageParams.map(async (imageParams) => {
-      await fs.mkdir(imageParams.model, { recursive: true });
-
-      await Promise.all(
-        ["jpg", "txt"].map((ext) => {
-          const fileName = `${imageParams.paramFileName}.${ext}`;
-          const newPath = path.join(imageParams.model, fileName);
-          return fs.rename(fileName, newPath);
+          } catch (err) {
+            console.error(chalk.red(err));
+          }
         })
       );
 
       console.log(
-        `Moved ${chalk.cyan(imageParams.paramFileName)} to ${chalk.magenta(imageParams.model)}.`
+        chalk.green(
+          `New batch of size ${chalk.cyan(batch.fileNames.length)} created at ${chalk.cyan(
+            batch.folderName
+          )}.`
+        )
       );
     })
   );
 
-  console.log(chalk.green("Files segmented by model."));
   if (!noEmit) mainEmitter.emit("done");
 };
 
@@ -978,24 +738,24 @@ export const generateImages = async ({
               await setActiveVAE(imageParams.vaeHash);
               GenQueue.setActiveVAEHash(imageParams.vaeHash);
             } else {
-            const vae = vaes.find((v) => v.hash === imageParams.vaeHash);
-            if (!vae) {
-              console.warn(
-                chalk.yellow(
-                  `VAE with hash ${chalk.magenta(
-                    imageParams.vaeHash
+              const vae = vaes.find((v) => v.hash === imageParams.vaeHash);
+              if (!vae) {
+                console.warn(
+                  chalk.yellow(
+                    `VAE with hash ${chalk.magenta(
+                      imageParams.vaeHash
                     )} does not exist. Setting active VAE to ${chalk.magenta("None")}...`
-                )
-              );
+                  )
+                );
 
                 await setActiveVAE("None");
                 GenQueue.setActiveVAEHash("None");
-            } else {
-              console.log(
-                `Setting active VAE to ${chalk.magenta(`${vae.fileName} (${vae.hash})`)}...`
-              );
+              } else {
+                console.log(
+                  `Setting active VAE to ${chalk.magenta(`${vae.fileName} (${vae.hash})`)}...`
+                );
                 await setActiveVAE(vae.fileName);
-              GenQueue.setActiveVAEHash(vae.hash);
+                GenQueue.setActiveVAEHash(vae.hash);
               }
             }
 
@@ -1103,39 +863,238 @@ export const generateImages = async ({
   }
 };
 
-/* --------------------------- Segment by Upscaled -------------------------- */
-export const segmentByUpscaled = async ({ paramFileNames, noEmit }: ParamFileNames & NoEmit) => {
-  console.log("Segmenting by upscaled...");
+/* ---------------- Generate Lora Training Folder and Params ---------------- */
+export const generateLoraTrainingFolderAndParams = async () => {
+  const trainingParams = await loadLoraTrainingParams(DEFAULT_LORA_PARAMS_PATH);
 
-  await Promise.all([
-    fs.mkdir(DIR_NAMES.upscaled, { recursive: true }),
-    fs.mkdir(DIR_NAMES.nonUpscaled, { recursive: true }),
-  ]);
+  const curDirName = path.basename(await fs.realpath("."));
+  const loraName =
+    (await prompt(`Enter Lora name ${chalk.grey(`(${curDirName})`)}: `)) || curDirName;
+  trainingParams.output_name = loraName;
 
-  let upscaledCount = 0;
-  let nonUpscaledCount = 0;
+  const modelList = await listModels(true);
+  const modelIndex = +(await prompt(
+    `${chalk.blueBright(
+      `Enter model to train on (1 - ${modelList.length}) ${chalk.grey(`(${DEFAULT_LORA_MODEL})`)}:`
+    )}\n${makeConsoleList(
+      modelList.map((m) => m.name),
+      true
+    )}\n`
+  ));
+  trainingParams.pretrained_model_name_or_path =
+    modelIndex > 0 && modelIndex <= modelList.length
+      ? modelList[modelIndex - 1].path
+      : DEFAULT_LORA_MODEL;
+
+  const { imageFileNames } = await listImageAndParamFileNames();
+
+  const imagesDirName = `input\\${Math.max(100, 1500 / imageFileNames.length)}_${loraName}`;
+  await Promise.all(
+    [imagesDirName, "logs", "output"].map((dirName) => fs.mkdir(dirName, { recursive: true }))
+  );
+
+  trainingParams.logging_dir = path.resolve("logs");
+  trainingParams.output_dir = path.resolve("output");
+  trainingParams.train_data_dir = path.resolve("input");
 
   await Promise.all(
-    paramFileNames.map(async (i) => {
-      const imageParams = await fs.readFile(`${i}.txt`);
-      const targetPath = imageParams.includes("Hires upscaler")
-        ? DIR_NAMES.upscaled
-        : DIR_NAMES.nonUpscaled;
-      const isUpscaled = targetPath === DIR_NAMES.upscaled;
-      isUpscaled ? upscaledCount++ : nonUpscaledCount++;
+    imageFileNames.map((fileName) =>
+      fs.rename(`${fileName}.jpg`, path.join(imagesDirName, `${fileName}.jpg`))
+    )
+  );
+  console.log(
+    `Moved ${chalk.cyan(imageFileNames.length)} images to ${chalk.magenta(imagesDirName)}.`
+  );
 
-      await Promise.all(
-        ["jpg", "txt"].map((ext) => fs.rename(`${i}.${ext}`, `${targetPath}\\${i}.${ext}`))
+  const trainingParamsJson = JSON.stringify(trainingParams, null, 2);
+  await fs.writeFile(LORA_TRAINING_PARAMS_FILE_NAME, trainingParamsJson);
+
+  console.log(
+    chalk.green(`Created ${LORA_TRAINING_PARAMS_FILE_NAME}:`),
+    chalk.cyan(trainingParamsJson)
+  );
+  mainEmitter.emit("done");
+};
+
+/* ---------------------- Generate Txt2Img Overrides ---------------------- */
+export const generateTxt2ImgOverrides = async () => {
+  const overrides: Txt2ImgOverrides = {};
+
+  const booleanPrompt = async (question: string, optName: string) => {
+    const res = (await prompt(chalk.blueBright(`${question} (y/n): `))) as "y" | "n";
+    if (res === "y" || res === "n") overrides[optName] = res === "y";
+  };
+
+  const numListPrompt = async (label: string, optName: string, options: string[]) => {
+    const index = +(await prompt(
+      `${chalk.blueBright(`Enter ${label} (1 - ${options.length}):`)}\n${makeConsoleList(
+        options,
+        true
+      )}\n`
+    ));
+
+    if (index > 0 && index <= options.length) overrides[optName] = options[index - 1];
+  };
+
+  const numericalPrompt = async (question: string, optName: string) => {
+    const res = await prompt(chalk.blueBright(question));
+    if (res.length > 0 && !isNaN(+res)) overrides[optName] = +res;
+  };
+
+  await numericalPrompt("Enter CFG Scale: ", "cfgScale");
+  await numericalPrompt("Enter Clip Skip: ", "clipSkip");
+  await numericalPrompt("Enter Denoising Strength: ", "denoisingStrength");
+  await numericalPrompt("Enter Hires Scale: ", "hiresScale");
+  const models = (await listModels()).map((m) => m.name);
+  await numListPrompt("Model", "model", models);
+  await booleanPrompt("Restore Faces?", "restoreFaces");
+  const samplers = await listSamplers();
+  await numListPrompt("Sampler", "sampler", samplers);
+  await numericalPrompt("Enter Seed: ", "seed");
+  await numericalPrompt("Enter Steps: ", "steps");
+  await numericalPrompt("Enter Subseed: ", "subseed");
+  await numericalPrompt("Enter Subseed Strength: ", "subseedStrength");
+  const upscalers = await listUpscalers();
+  await numListPrompt("Upscaler", "upscaler", upscalers);
+  const vaes = await listVAEs();
+  await numListPrompt("VAE", "vae", ["None", "Automatic"].concat(vaes.map((v) => v.fileName)));
+
+  const overridesJson = JSON.stringify(overrides, null, 2);
+  await fs.writeFile(TXT2IMG_OVERRIDES_FILE_NAME, overridesJson);
+
+  console.log(chalk.green(`Created ${TXT2IMG_OVERRIDES_FILE_NAME}:`), chalk.cyan(overridesJson));
+  mainEmitter.emit("done");
+};
+
+/* --------------- Initialize Automatic1111 Folders (Symlinks) -------------- */
+export const initAutomatic1111Folders = async () => {
+  const promptForPath = async (question: string) =>
+    (await prompt(chalk.blueBright(question))).replace(/\"|^(\r|\s)|(\r|\s)$/gim, "");
+
+  try {
+    const rootDir = await fs.realpath(".");
+    console.log("Root Automatic1111 folder path: ", chalk.cyan(rootDir));
+
+    const promptForSymlink = async (targetDirName: string, sourceDir: string) => {
+      const folder = await promptForPath(
+        `Enter path of external ${chalk.magenta(targetDirName)} folder: `
       );
-      console.log(`Moved ${i} to ${(isUpscaled ? chalk.green : chalk.yellow)(targetPath)}.`);
+      if (!folder.length)
+        console.warn(chalk.yellow(`Not linking ${chalk.magenta(targetDirName)} folder.`));
+      else {
+        const hasSourceDir = await doesPathExist(sourceDir);
+        if (hasSourceDir) await fs.rename(sourceDir, `${sourceDir} (OLD)`);
+
+        await fs.symlink(folder, path.join(rootDir, sourceDir), "junction");
+        console.log(chalk.green(`${targetDirName} folder linked.`));
+      }
+    };
+
+    await promptForSymlink("Embeddings", "embeddings");
+    await promptForSymlink("Extensions", "extensions");
+    await promptForSymlink("Lora", "models\\Lora");
+    await promptForSymlink("LyCORIS / LoCon / LoHa", "models\\LyCORIS");
+    await promptForSymlink("Models", "models\\Stable-diffusion");
+    await promptForSymlink("Outputs", "outputs");
+    await promptForSymlink("VAE", "models\\VAE");
+    await promptForSymlink("ControlNet Poses", "models\\ControlNet");
+  } catch (err) {
+    console.error(chalk.red(err));
+  } finally {
+    mainEmitter.emit("done");
+  }
+};
+
+/* ------------------- Prune Files Found in Other Folders ------------------- */
+export const pruneFilesFoundInFolders = async ({
+  imageFileNames,
+  noEmit,
+}: ImageFileNames & NoEmit) => {
+  const otherPaths = (await prompt(chalk.blueBright("Enter folder paths to exclude: ")))
+    .replace(/^(,|\s)|(,|\s)$/g, "")
+    .split("|")
+    .map((p) => p.trim());
+
+  const imagesInOtherFolders = await getImagesInFolders({ paths: otherPaths });
+
+  const imagesInCurFolderAndOtherFolders = listImagesFoundInOtherFolders({
+    imageFileNames,
+    imagesInOtherFolders,
+  });
+
+  const targetDir = DIR_NAMES.prunedImagesOtherFolders;
+  await fs.mkdir(targetDir, { recursive: true });
+
+  await Promise.all(
+    imagesInCurFolderAndOtherFolders.map(async (img) => {
+      const fileName = `${img.name}.${img.ext}`;
+      await fs.rename(fileName, path.join(targetDir, fileName));
+      console.log(`Pruned ${chalk.yellow(fileName)}.`);
     })
   );
 
-  console.log(
-    `${chalk.green("Files segmented by upscaled.")} ${chalk.cyan(
-      upscaledCount
-    )} upscaled images. ${chalk.yellow(nonUpscaledCount)} non-upscaled images.`
+  console.log(chalk.green("All images found in other folders pruned."));
+  if (!noEmit) mainEmitter.emit("done");
+};
+
+/* ------------------- Prune Generation Parameters ------------------- */
+export const pruneImageParams = async ({
+  noEmit,
+  imageFileNames,
+  paramFileNames,
+}: FileNames & NoEmit) => {
+  const unusedParams: string[] = [];
+  const dirName = DIR_NAMES.prunedParams;
+  await fs.mkdir(dirName, { recursive: true });
+
+  await Promise.all(
+    paramFileNames.map(async (p) => {
+      const image = imageFileNames.find((i) => i === p);
+      if (!image) {
+        const fileName = `${p}.txt`;
+        await fs.rename(fileName, path.join(dirName, path.basename(fileName)));
+        unusedParams.push(p);
+        console.log(chalk.yellow(`${fileName} pruned.`));
+      }
+    })
   );
+
+  console.log(`${chalk.yellow(unusedParams.length)} unused params pruned.`);
+  if (!noEmit) mainEmitter.emit("done");
+
+  return unusedParams;
+};
+
+/* ------------ Prune Generation Parameters & Segment by Upscaled ----------- */
+export const pruneParamsAndSegmentUpscaled = async (fileNames: FileNames) => {
+  try {
+    const prunedParams = await pruneImageParams({ ...fileNames, noEmit: true });
+    const filteredParamNames = fileNames.paramFileNames.filter((p) => !prunedParams.includes(p));
+    await segmentByUpscaled({ paramFileNames: filteredParamNames, noEmit: true });
+  } catch (err) {
+    console.error(chalk.red(err));
+  } finally {
+    mainEmitter.emit("done");
+  }
+};
+
+/* -------------------------- Segment by Dimensions ------------------------- */
+export const segmentByDimensions = async ({ imageFileNames, noEmit }: ImageFileNames & NoEmit) => {
+  console.log("Segmenting by dimensions...");
+
+  await Promise.all(
+    imageFileNames.map(async (fileName) => {
+      const { height, width } = await sharp(`${fileName}.jpg`).metadata();
+      const dirName = `${height} x ${width}`;
+
+      await fs.mkdir(dirName, { recursive: true });
+      await Promise.all(
+        ["jpg", "txt"].map((ext) => fs.rename(fileName, path.join(dirName, `${fileName}.${ext}`)))
+      );
+      console.log(`Moved ${chalk.cyan(fileName)} to ${chalk.magenta(dirName)}.`);
+    })
+  );
+
   if (!noEmit) mainEmitter.emit("done");
 };
 
@@ -1199,5 +1158,73 @@ export const segmentByKeywords = async ({
   );
 
   console.log(chalk.cyan(segmentedCount), chalk.green(" files segmented by keyword."));
+  if (!noEmit) mainEmitter.emit("done");
+};
+
+/* ---------------------------- Segment by Model ---------------------------- */
+export const segmentByModel = async ({
+  imageFileNames,
+  paramFileNames,
+  noEmit,
+}: FileNames & NoEmit) => {
+  console.log("Segmenting by model...");
+
+  const allImageParams = await parseAndSortImageParams({ imageFileNames, paramFileNames });
+
+  await Promise.all(
+    allImageParams.map(async (imageParams) => {
+      await fs.mkdir(imageParams.model, { recursive: true });
+
+      await Promise.all(
+        ["jpg", "txt"].map((ext) => {
+          const fileName = `${imageParams.paramFileName}.${ext}`;
+          const newPath = path.join(imageParams.model, fileName);
+          return fs.rename(fileName, newPath);
+        })
+      );
+
+      console.log(
+        `Moved ${chalk.cyan(imageParams.paramFileName)} to ${chalk.magenta(imageParams.model)}.`
+      );
+    })
+  );
+
+  console.log(chalk.green("Files segmented by model."));
+  if (!noEmit) mainEmitter.emit("done");
+};
+
+/* --------------------------- Segment by Upscaled -------------------------- */
+export const segmentByUpscaled = async ({ paramFileNames, noEmit }: ParamFileNames & NoEmit) => {
+  console.log("Segmenting by upscaled...");
+
+  await Promise.all([
+    fs.mkdir(DIR_NAMES.upscaled, { recursive: true }),
+    fs.mkdir(DIR_NAMES.nonUpscaled, { recursive: true }),
+  ]);
+
+  let upscaledCount = 0;
+  let nonUpscaledCount = 0;
+
+  await Promise.all(
+    paramFileNames.map(async (i) => {
+      const imageParams = await fs.readFile(`${i}.txt`);
+      const targetPath = imageParams.includes("Hires upscaler")
+        ? DIR_NAMES.upscaled
+        : DIR_NAMES.nonUpscaled;
+      const isUpscaled = targetPath === DIR_NAMES.upscaled;
+      isUpscaled ? upscaledCount++ : nonUpscaledCount++;
+
+      await Promise.all(
+        ["jpg", "txt"].map((ext) => fs.rename(`${i}.${ext}`, `${targetPath}\\${i}.${ext}`))
+      );
+      console.log(`Moved ${i} to ${(isUpscaled ? chalk.green : chalk.yellow)(targetPath)}.`);
+    })
+  );
+
+  console.log(
+    `${chalk.green("Files segmented by upscaled.")} ${chalk.cyan(
+      upscaledCount
+    )} upscaled images. ${chalk.yellow(nonUpscaledCount)} non-upscaled images.`
+  );
   if (!noEmit) mainEmitter.emit("done");
 };
