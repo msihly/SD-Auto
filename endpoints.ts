@@ -1083,15 +1083,19 @@ export const segmentByDimensions = async ({ imageFileNames, noEmit }: ImageFileN
   console.log("Segmenting by dimensions...");
 
   await Promise.all(
-    imageFileNames.map(async (fileName) => {
-      const { height, width } = await sharp(`${fileName}.jpg`).metadata();
+    imageFileNames.map(async (name) => {
+      const { height, width } = await sharp(`${name}.jpg`).metadata();
       const dirName = `${height} x ${width}`;
 
       await fs.mkdir(dirName, { recursive: true });
       await Promise.all(
-        ["jpg", "txt"].map((ext) => fs.rename(fileName, path.join(dirName, `${fileName}.${ext}`)))
+        ["jpg", "txt"].map((ext) => {
+          const fileName = `${name}.${ext}`;
+          return fs.rename(fileName, path.join(dirName, fileName));
+        })
       );
-      console.log(`Moved ${chalk.cyan(fileName)} to ${chalk.magenta(dirName)}.`);
+
+      console.log(`Moved ${chalk.cyan(name)} to ${chalk.magenta(dirName)}.`);
     })
   );
 
