@@ -3,8 +3,7 @@ import { prompt, readline } from "./utils";
 import { FileNames } from "./types";
 import {
   convertImagesInCurDirToJPG,
-  generateBatch,
-  generateBatchesExhaustive,
+  generateBatches,
   generateImages,
   generateLoraTrainingFolderAndParams,
   generateTxt2ImgOverrides,
@@ -14,7 +13,6 @@ import {
   listImageAndParamFileNames,
   listModels,
   listVAEs,
-  mainEmitter,
   pruneFilesFoundInFolders,
   pruneImageParams,
   pruneParamsAndSegmentUpscaled,
@@ -26,63 +24,39 @@ import {
 
 const SCRIPT_OPTS: {
   action: ({ imageFileNames, paramFileNames }?: FileNames) => any;
+  hasRecursiveOption?: boolean;
   needsFiles: boolean;
-  needsRecursiveFiles?: boolean;
   label: string;
 }[] = [
   {
-    action: generateBatchesExhaustive,
+    action: generateBatches,
+    hasRecursiveOption: true,
     label: "Generate Batches Exhaustively",
     needsFiles: true,
   },
   {
-    action: generateBatchesExhaustive,
-    label: "Generate Batches Exhaustively (Recursive)",
-    needsFiles: true,
-    needsRecursiveFiles: true,
-  },
-  {
-    action: (fileNames: FileNames) => generateBatchesExhaustive({ ...fileNames, shuffle: true }),
+    action: (fileNames: FileNames) => generateBatches({ ...fileNames, shuffle: true }),
+    hasRecursiveOption: true,
     label: "Generate Batches Exhaustively (Shuffled)",
     needsFiles: true,
   },
   {
-    action: (fileNames: FileNames) => generateBatchesExhaustive({ ...fileNames, shuffle: true }),
-    label: "Generate Batches Exhaustively (Shuffled) (Recursive)",
-    needsFiles: true,
-    needsRecursiveFiles: true,
-  },
-  {
-    action: generateBatch,
-    label: "Generate Batch",
-    needsFiles: true,
-  },
-  {
     action: (fileNames: FileNames) => generateImages({ ...fileNames, mode: "upscale" }),
+    hasRecursiveOption: true,
     label: "Upscale (Hires Fix)",
     needsFiles: true,
   },
   {
-    action: (fileNames: FileNames) => generateImages({ ...fileNames, mode: "upscale" }),
-    label: "Upscale (Hires Fix) (Recursive)",
-    needsFiles: true,
-    needsRecursiveFiles: true,
-  },
-  {
     action: pruneParamsAndSegmentUpscaled,
+    hasRecursiveOption: true,
     label: "Prune Params & Segment by Upscaled",
     needsFiles: true,
   },
   {
     action: pruneImageParams,
+    hasRecursiveOption: true,
     label: "Prune Generation Parameters",
     needsFiles: true,
-  },
-  {
-    action: pruneImageParams,
-    label: "Prune Generation Parameters (Recursive)",
-    needsFiles: true,
-    needsRecursiveFiles: true,
   },
   {
     action: pruneFilesFoundInFolders,
@@ -91,34 +65,33 @@ const SCRIPT_OPTS: {
   },
   {
     action: segmentByUpscaled,
+    hasRecursiveOption: true,
     label: "Segment by Upscaled",
     needsFiles: true,
   },
   {
     action: segmentByKeywords,
+    hasRecursiveOption: true,
     label: "Segment by Keywords",
     needsFiles: true,
   },
   {
     action: segmentByModel,
+    hasRecursiveOption: true,
     label: "Segment by Model",
     needsFiles: true,
   },
   {
     action: segmentByDimensions,
+    hasRecursiveOption: true,
     label: "Segment by Dimensions",
     needsFiles: true,
   },
   {
     action: (fileNames: FileNames) => generateImages({ ...fileNames, mode: "reproduce" }),
+    hasRecursiveOption: true,
     label: "Segment by Reproducible",
     needsFiles: true,
-  },
-  {
-    action: (fileNames: FileNames) => generateImages({ ...fileNames, mode: "reproduce" }),
-    label: "Segment by Reproducible (Recursive)",
-    needsFiles: true,
-    needsRecursiveFiles: true,
   },
   {
     action: generateTxt2ImgOverrides,
@@ -136,34 +109,22 @@ const SCRIPT_OPTS: {
     needsFiles: false,
   },
   {
-    action: async () => {
-      await getActiveModel(true);
-      mainEmitter.emit("done");
-    },
+    action: () => getActiveModel(true, true),
     label: "Get Active Model",
     needsFiles: false,
   },
   {
-    action: async () => {
-      await getActiveVAE(true);
-      mainEmitter.emit("done");
-    },
+    action: () => getActiveVAE(true, true),
     label: "Get Active VAE",
     needsFiles: false,
   },
   {
-    action: async () => {
-      await listModels(true);
-      mainEmitter.emit("done");
-    },
+    action: () => listModels(true, true),
     label: "List Models",
     needsFiles: false,
   },
   {
-    action: async () => {
-      await listVAEs(true);
-      mainEmitter.emit("done");
-    },
+    action: () => listVAEs(true, true),
     label: "List VAEs",
     needsFiles: false,
   },
@@ -176,11 +137,18 @@ const SCRIPT_OPTS: {
 
 export const main = async () => {
   try {
-    const scriptIndex = +(await prompt(
-      `${SCRIPT_OPTS.map((opt, i) => `  ${chalk.cyan(i + 1)}: ${opt.label}`).join(
-        "\n"
-      )}\n${chalk.red("  0:")} Exit\n${chalk.blueBright("Select an option: ")} `
-    ));
+    const input = await prompt(
+      `${SCRIPT_OPTS.map(
+        (opt, i) =>
+          `  ${chalk.cyan(i + 1)}: ${opt.label}${
+            opt.hasRecursiveOption ? chalk.magenta(" (r)") : ""
+          }`
+      ).join("\n")}\n${chalk.red("  0:")} Exit\n${chalk.blueBright(
+        `Select an option ${chalk.grey("(with --r flag for recursion)")}: `
+      )} `
+    );
+
+    const scriptIndex = +input.replace(/\D+/gi, "");
 
     if (isNaN(scriptIndex) || scriptIndex < 0 || scriptIndex > SCRIPT_OPTS.length)
       throw new Error(`Invalid selection. Enter a number between 0 and ${SCRIPT_OPTS.length}.`);
@@ -191,7 +159,8 @@ export const main = async () => {
     if (!script) throw new Error("Failed to find matching script.");
 
     if (script.needsFiles) {
-      const fileNames = await listImageAndParamFileNames(script.needsRecursiveFiles);
+      const withRecursion = script.hasRecursiveOption && input.includes("--r");
+      const fileNames = await listImageAndParamFileNames(withRecursion);
       script.action(fileNames);
     } else script.action();
   } catch (err) {

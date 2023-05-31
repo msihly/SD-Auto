@@ -2,10 +2,12 @@ import fs from "fs/promises";
 import EventEmitter from "events";
 import path from "path";
 import { performance } from "perf_hooks";
-import axios from "axios";
+import axios, { AxiosRequestConfig } from "axios";
 import chalk from "chalk";
 import dayjs from "dayjs";
 import sharp from "sharp";
+import exitHook from "async-exit-hook";
+import cliProgress from "cli-progress";
 import { main } from "./main";
 import {
   API_URL,
@@ -44,10 +46,12 @@ import {
   escapeRegEx,
   getImagesInFolders,
   makeConsoleList,
+  makeExistingValueLog,
   prompt,
   randomSort,
   round,
   sha256File,
+  valsToOpts,
 } from "./utils";
 
 /* -------------------------------------------------------------------------- */
@@ -57,53 +61,78 @@ import {
 export const mainEmitter = new EventEmitter();
 
 mainEmitter.on("done", () => {
-  console.log(chalk.grey("-".repeat(100)));
-  main();
+  setTimeout(() => {
+    console.log(chalk.grey("-".repeat(100)));
+    main();
+  }, 500);
 });
 
-/* ----------- Sequential Generation for Upscaling / Reproduction ----------- */
-export class GenerationQueue extends PromiseQueue {
-  activeModel: string = null;
-  activeVAEHash: string = null;
+/* ------------------------- Automatic1111 REST API ------------------------- */
+const apiCall = async (method: "GET" | "POST", endpoint: string, config?: AxiosRequestConfig) => {
+  try {
+    const res = await axios({ method, url: `${API_URL}/${endpoint}`, ...config });
+    return { success: true, data: res?.data };
+  } catch (err) {
+    const errMsg = err.message.includes("ECONNREFUSED")
+      ? "Automatic1111 server is not connected. Start server to use this command."
+      : err.stack;
+    console.error(chalk.red(errMsg));
 
-  getActiveModel() {
-    return this.activeModel;
+    mainEmitter.emit("done");
+    return { success: false, error: errMsg };
   }
+};
 
-  getActiveVAEHash() {
-    return this.activeVAEHash;
-  }
-
-  getOutputDir() {
-    return path.join(OUTPUT_DIR, dayjs().format("YYYY-MM-DD"));
-  }
-
-  setActiveModel(model: string) {
-    this.activeModel = model;
-  }
-
-  setActiveVAEHash(vae: string) {
-    this.activeVAEHash = vae;
-  }
-}
+export const API = {
+  Auto1111: {
+    get: (endpoint: string, config?: AxiosRequestConfig) => apiCall("GET", endpoint, config),
+    post: (endpoint: string, config?: AxiosRequestConfig) => apiCall("POST", endpoint, config),
+  },
+};
 
 /* ---------------------------- Get Active Model ---------------------------- */
-export const getActiveModel = async (withConsole = false) => {
-  const config = (await axios({ method: "GET", url: `${API_URL}/options` }))?.data;
-  const model = (config?.sd_model_checkpoint as string)
+export const getActiveModel = async (withConsole = false, withEmit = false) => {
+  const res = await API.Auto1111.get("options");
+  if (!res.success) {
+    if (withEmit) {
+      mainEmitter.emit("done");
+      return;
+    } else throw new Error(res.error);
+  }
+
+  const model = (res.data?.sd_model_checkpoint as string)
     .replace(/\\/gi, "_")
     .replace(/(\.(ckpt|checkpoint|safetensors))|(\[.+\]$)/gi, "")
     .trim();
   if (withConsole) console.log("Active model: ", chalk.cyan(model));
+  if (withEmit) mainEmitter.emit("done");
   return model;
 };
 
 /* ---------------------------- Get Active VAE ---------------------------- */
-export const getActiveVAE = async (withConsole = false) => {
-  const config = (await axios({ method: "GET", url: `${API_URL}/options` }))?.data;
-  const vae = (config?.sd_vae as string).trim();
+export const getActiveVAE = async (withConsole = false, withEmit = false) => {
+  const res = await API.Auto1111.get("options");
+  if (!res.success) {
+    if (withEmit) {
+      mainEmitter.emit("done");
+      return;
+    } else throw new Error(res.error);
+  }
+
+  const vae = (res.data?.sd_vae as string).trim();
   if (withConsole) console.log("Active VAE: ", chalk.cyan(vae));
+  if (withEmit) mainEmitter.emit("done");
   return vae;
+};
+
+/* -------------------------- Interrupt Generation -------------------------- */
+export const interruptGeneration = async (withConsole = false) => {
+  if (withConsole) console.log(chalk.yellow("Interrupting generation..."));
+  const res = await API.Auto1111.post("interrupt");
+  if (withConsole) {
+    if (!res.success) throw new Error(res.error);
+    else console.log(chalk.green("Generation interrupted!"));
+  }
 };
 
 /* -------------- Get Image and Generatiom Parameter File Names ------------- */
@@ -168,32 +197,55 @@ export const listImagesFoundInOtherFolders = ({
 };
 
 /* ---------------------- List Models ---------------------- */
-export const listModels = async (withConsole = false) => {
-  const models = (await axios({ method: "GET", url: `${API_URL}/sd-models` }))?.data?.map((m) => ({
+export const listModels = async (withConsole = false, withEmit = false) => {
+  const res = await API.Auto1111.get("sd-models");
+  if (!res.success) {
+    if (withEmit) {
+      mainEmitter.emit("done");
+      return;
+    } else throw new Error(res.error);
+  }
+
+  const models = res.data?.map((m) => ({
     hash: m.hash,
     name: m.model_name.replace(/,|^(\n|\r|\s)|(\n|\r|\s)$/gim, ""),
     path: m.filename,
   })) as { hash: string; name: string; path: string }[];
   if (withConsole)
     console.log(`Models:\n${chalk.cyan(makeConsoleList(models.map((m) => m.name)))}`);
+  if (withEmit) mainEmitter.emit("done");
   return models;
 };
 
 /* ---------------------- List Samplers ---------------------- */
-export const listSamplers = async (withConsole = false) => {
-  const samplers = (await axios({ method: "GET", url: `${API_URL}/samplers` }))?.data?.map(
-    (s) => s.name
-  ) as string[];
+export const listSamplers = async (withConsole = false, withEmit = false) => {
+  const res = await API.Auto1111.get("samplers");
+  if (!res.success) {
+    if (withEmit) {
+      mainEmitter.emit("done");
+      return;
+    } else throw new Error(res.error);
+  }
+
+  const samplers = res?.data?.map((s) => s.name) as string[];
   if (withConsole) console.log(`Samplers:\n${chalk.cyan(makeConsoleList(samplers))}`);
+  if (withEmit) mainEmitter.emit("done");
   return samplers;
 };
 
 /* ---------------------- List Upscalers ---------------------- */
-export const listUpscalers = async (withConsole = false) => {
-  const upscalers = (await axios({ method: "GET", url: `${API_URL}/upscalers` }))?.data?.map(
-    (s) => s.name
-  ) as string[];
+export const listUpscalers = async (withConsole = false, withEmit = false) => {
+  const res = await API.Auto1111.get("upscalers");
+  if (!res.success) {
+    if (withEmit) {
+      mainEmitter.emit("done");
+      return;
+    } else throw new Error(res.error);
+  }
+
+  const upscalers = res?.data?.map((s) => s.name) as string[];
   if (withConsole) console.log(`Upscalers:\n${chalk.cyan(makeConsoleList(upscalers))}`);
+  if (withEmit) mainEmitter.emit("done");
   return upscalers;
 };
 
@@ -202,7 +254,7 @@ export const listUpscalers = async (withConsole = false) => {
  * Uses hashing algorithm used internally by Automatic1111.
  * @see [Line 138 of /modules/sd_models in related commit](https://github.dev/liamkerr/stable-diffusion-webui/blob/66cad3ab6f1a06a15b7302d1788a1574dd08ce86/modules/sd_models.py#L132)
  */
-export const listVAEs = async (withConsole = false) => {
+export const listVAEs = async (withConsole = false, withEmit = false) => {
   const vaes = await Promise.all(
     (
       await dirToFilePaths(VAE_DIR)
@@ -227,18 +279,24 @@ export const listVAEs = async (withConsole = false) => {
         )
       )}`
     );
+  if (withEmit) mainEmitter.emit("done");
   return vaes;
 };
 
 /* --------------------- Load Txt2Img Generation Overrides From File --------------------- */
-export const loadTxt2ImgOverrides = async (paramFileName: string) => {
+export const loadTxt2ImgOverrides = async (dirPath: string = ".") => {
   try {
-    const dirname = path.dirname(`${paramFileName}.txt`);
-    const res = await fs.readFile(path.resolve(dirname, TXT2IMG_OVERRIDES_FILE_NAME), {
-      encoding: "utf8",
-    });
-    return JSON.parse(res) as Txt2ImgOverrides;
+    const filePath = path.resolve(dirPath, TXT2IMG_OVERRIDES_FILE_NAME);
+    const fileExists = await doesPathExist(filePath);
+    if (!fileExists) return {};
+    else
+      return JSON.parse(
+        await fs.readFile(path.resolve(dirPath, TXT2IMG_OVERRIDES_FILE_NAME), {
+          encoding: "utf8",
+        })
+      ) as Txt2ImgOverrides;
   } catch (err) {
+    console.error(chalk.red("Error reading txt2img overrides: ", err.stack));
     return {};
   }
 };
@@ -297,15 +355,14 @@ export const parseImageParam = <IsNum extends boolean>(
 /* ----------------- Parse Image Generation Parameters File ----------------- */
 export const parseImageParams = async ({
   models,
+  overrides,
   paramFileName,
 }: {
   models: Model[];
+  overrides?: Txt2ImgOverrides;
   paramFileName: string;
 }) => {
-  const [imageParams, overrides] = await Promise.all([
-    await fs.readFile(`${paramFileName}.txt`, { encoding: "utf8" }),
-    await loadTxt2ImgOverrides(paramFileName),
-  ]);
+  const imageParams = await fs.readFile(`${paramFileName}.txt`, { encoding: "utf8" });
 
   const negPromptEndIndex = imageParams.indexOf("Steps: ");
   let negPromptStartIndex = imageParams.indexOf("Negative prompt: ");
@@ -336,6 +393,8 @@ export const parseImageParams = async ({
   const hasRestoreFaces = overrides?.restoreFaces ?? !!restParams.includes("Face restoration");
   const hiresDenoisingStrength = overrides?.denoisingStrength ?? DEFAULT_HIRES_DENOISING_STRENGTH;
   const hiresScale = overrides?.hiresScale ?? DEFAULT_HIRES_SCALE;
+  const hiresSteps =
+    overrides?.hiresSteps ?? parseImageParam(restParams, "Hires steps", true, true);
   const hiresUpscaler = overrides?.upscaler ?? DEFAULT_HIRES_UPSCALER;
   const sampler = overrides?.sampler ?? parseImageParam(restParams, "Sampler", false);
   const seed = overrides?.seed ?? parseImageParam(restParams, "Seed", true);
@@ -400,6 +459,7 @@ export const parseImageParams = async ({
     height,
     hiresDenoisingStrength,
     hiresScale,
+    hiresSteps,
     hiresUpscaler,
     model,
     negPrompt,
@@ -431,9 +491,28 @@ export const parseAndSortImageParams = async ({ imageFileNames, paramFileNames }
 
   console.log("Parsing and sorting image params...");
   const models = await listModels();
+
+  const dirGroups = paramFileNames.reduce((acc, cur) => {
+    const dirPath = path.dirname(cur);
+    const dirGroup = acc.find((a) => a.dirPath === dirPath);
+    if (dirGroup) dirGroup.fileNames.push(cur);
+    else acc.push({ dirPath, fileNames: [cur] });
+    return acc;
+  }, [] as { dirPath: string; fileNames: string[]; overrides?: Txt2ImgOverrides }[]);
+
+  await Promise.all(
+    dirGroups.map(async (d) => {
+      d.overrides = await loadTxt2ImgOverrides(d.dirPath);
+    })
+  );
+
   const allImageParams = (
     await Promise.all(
-      paramFileNames.map((paramFileName) => parseImageParams({ models, paramFileName }))
+      dirGroups.flatMap(({ overrides, fileNames }) =>
+        fileNames.map((fileName) =>
+          parseImageParams({ models, overrides, paramFileName: fileName })
+        )
+      )
     )
   ).sort((a, b) => {
     if (a.vaeHash && !b.vaeHash) return -1;
@@ -496,44 +575,26 @@ export const remapModelName = (models: { hash: string; name: string }[], modelHa
 /* ----------------------------- Refresh Models ----------------------------- */
 export const refreshModels = async () => {
   console.log("Refreshing models...");
-  await axios({ method: "POST", url: `${API_URL}/refresh-checkpoints` });
+  const res = await API.Auto1111.post("refresh-checkpoints");
+  if (!res.success) throw new Error(res.error);
   console.log(chalk.green("Models refreshed."));
 };
 
 /* ---------------------------- Set Active Model ---------------------------- */
 export const setActiveModel = async (modelName: string) => {
-  const res = await axios({
-    method: "POST",
-    url: `${API_URL}/options`,
-    data: { sd_model_checkpoint: modelName },
-  });
-
-  if (res.status !== 200) throw new Error(`Failed to set active model to ${modelName}.`);
+  const res = await API.Auto1111.post("options", { data: { sd_model_checkpoint: modelName } });
+  if (!res.success) throw new Error(res.error);
 };
 
 /* ---------------------------- Set Active VAE ---------------------------- */
-/** Current bug with setting VAE that requires switching to another VAE or checkpoint before switching to desired VAE, otherwise will not take effect. */
 export const setActiveVAE = async (vaeName: "None" | "Automatic" | string) => {
-  let res = await axios({
-    method: "POST",
-    url: `${API_URL}/options`,
-    data: { sd_vae: vaeName },
-  });
-  if (res.status !== 200) throw new Error(`Failed to set active VAE to ${vaeName}.`);
-
-  res = await axios({
-    method: "POST",
-    url: `${API_URL}/options`,
-    data: { sd_vae: "None" },
-  });
-  if (res.status !== 200) throw new Error(`Failed to set active VAE to ${vaeName}.`);
-
-  res = await axios({
-    method: "POST",
-    url: `${API_URL}/options`,
-    data: { sd_vae: vaeName },
-  });
-  if (res.status !== 200) throw new Error(`Failed to set active VAE to ${vaeName}.`);
+  /** Current bug with setting VAE that requires switching to another VAE or checkpoint before switching to desired VAE, otherwise will not take effect. */
+  let res = await API.Auto1111.post("options", { data: { sd_vae: vaeName } });
+  if (!res.success) throw new Error(res.error);
+  res = await API.Auto1111.post("options", { data: { sd_vae: "None" } });
+  if (!res.success) throw new Error(res.error);
+  res = await API.Auto1111.post("options", { data: { sd_vae: vaeName } });
+  if (!res.success) throw new Error(res.error);
 };
 
 /* -------------------------------------------------------------------------- */
@@ -555,36 +616,8 @@ export const convertImagesInCurDirToJPG = async () => {
   mainEmitter.emit("done");
 };
 
-/* ----------------------------- Generate Batch ----------------------------- */
-export const generateBatch = async ({ imageFileNames, noEmit }: ImageFileNames & NoEmit) => {
-  const targetPath = (await prompt(chalk.blueBright("Enter target path: "))).trim();
-  await fs.mkdir(targetPath, { recursive: true });
-
-  const { batchSize, filesNotInOtherFolders } = await promptForBatchParams({ imageFileNames });
-  const filesToCopy = filesNotInOtherFolders.slice(0, batchSize);
-
-  await Promise.all(
-    filesToCopy
-      .map(async (imageFileName) => {
-        const fileName = `${imageFileName}.jpg`;
-
-        fs.copyFile(fileName, path.join(targetPath, fileName)).catch((err) =>
-          console.error(chalk.red(err))
-        );
-
-        console.log(`Moved ${chalk.cyan(imageFileName)} to ${chalk.magenta(targetPath)}.`);
-      })
-      .flat()
-  );
-
-  console.log(
-    chalk.green(`New batch of size ${chalk.cyan(batchSize)} created at ${chalk.cyan(targetPath)}.`)
-  );
-  if (!noEmit) mainEmitter.emit("done");
-};
-
-/* ----------------------------- Generate Batches (Exhaustive) ----------------------------- */
-export const generateBatchesExhaustive = async ({
+/* ----------------------------- Generate Batches Exhaustively ----------------------------- */
+export const generateBatches = async ({
   imageFileNames,
   shuffle = false,
   noEmit,
@@ -631,7 +664,68 @@ export const generateBatchesExhaustive = async ({
 };
 
 /* ------------------------- Generate Images (Hires Fix / Segment by Reproducible) ------------------------ */
+export class GenerationQueue extends PromiseQueue {
+  activeModel: string = null;
+
+  activeVAEHash: string = null;
+
+  progress = new cliProgress.SingleBar(
+    {
+      format: `${chalk.cyan("{bar}")} {percentage}% | ${chalk.blueBright(
+        "Elapsed:"
+      )} {duration_formatted} | ${chalk.blueBright("ETA:")} {formattedETA}`,
+    },
+    cliProgress.Presets.shades_classic
+  );
+
+  progressInterval: NodeJS.Timer = null;
+
+  endProgress() {
+    clearInterval(this.progressInterval);
+    this.progressInterval = null;
+    this.progress.stop();
+  }
+
+  getActiveModel() {
+    return this.activeModel;
+  }
+
+  getActiveVAEHash() {
+    return this.activeVAEHash;
+  }
+
+  getOutputDir() {
+    return path.join(OUTPUT_DIR, dayjs().format("YYYY-MM-DD"));
+  }
+
+  setActiveModel(model: string) {
+    this.activeModel = model;
+  }
+
+  setActiveVAEHash(vae: string) {
+    this.activeVAEHash = vae;
+  }
+
+  async startProgress() {
+    this.progress.start(1, 0, { formattedETA: "N/A" });
+
+    this.progressInterval = setInterval(async () => {
+      const res = await API.Auto1111.get("progress");
+      if (!res.success) console.debug("Failed to update progress.");
+      else
+        this.progress.update(res.data.progress, {
+          formattedETA: `${round(+res.data.eta_relative)}s`,
+        });
+    }, 1000);
+  }
+}
+
 export const GenQueue = new GenerationQueue();
+
+exitHook(async (callback) => {
+  if (GenQueue.isPending()) await interruptGeneration(true);
+  callback();
+});
 
 export const generateImages = async ({
   mode,
@@ -689,6 +783,7 @@ export const generateImages = async ({
             enable_hr: mode === "upscale",
             height: imageParams.height,
             hr_scale: imageParams.hiresScale,
+            hr_steps: imageParams.hiresSteps,
             hr_upscaler: imageParams.hiresUpscaler,
             negative_prompt: imageParams.negPrompt,
             override_settings: { CLIP_stop_at_last_layers: imageParams.clipSkip ?? 1 },
@@ -763,19 +858,17 @@ export const generateImages = async ({
           }
 
           console.log(`Beginning ${mode === "upscale" ? "upscale" : "reproduction"}...`);
+          GenQueue.startProgress();
 
-          const res = (
-            await axios({
-              method: "POST",
-              url: `${API_URL}/txt2img`,
-              headers: { "Content-Type": "application/json" },
-              data: requestBody,
-            })
-          )?.data;
+          const res = await API.Auto1111.post("txt2img", {
+            headers: { "Content-Type": "application/json" },
+            data: requestBody,
+          });
+          if (!res.success) throw new Error(res.error);
 
-          const genImageBuffer = Buffer.from(res.images[0], "base64");
+          const genImageBuffer = Buffer.from(res.data?.images[0], "base64");
           const genParams =
-            (JSON.parse(res.info).infotexts[0] as string) +
+            (JSON.parse(res.data?.info).infotexts[0] as string) +
             (imageParams.template ? `\nTemplate: ${imageParams.template}` : "") +
             (imageParams.negTemplate ? `\nNegative Template: ${imageParams.negTemplate}` : "");
 
@@ -836,6 +929,7 @@ export const generateImages = async ({
             );
           }
 
+          GenQueue.endProgress();
           completedCount++;
           const isComplete = completedCount === totalCount;
 
@@ -854,6 +948,7 @@ export const generateImages = async ({
             mainEmitter.emit("done");
           }
         } catch (err) {
+          GenQueue.endProgress();
           console.error(chalk.red(err.stack));
         }
       })
@@ -888,7 +983,8 @@ export const generateLoraTrainingFolderAndParams = async () => {
 
   const { imageFileNames } = await listImageAndParamFileNames();
 
-  const imagesDirName = `input\\${Math.max(100, 1500 / imageFileNames.length)}_${loraName}`;
+  const trainingSteps = Math.ceil(Math.max(100, 1500 / imageFileNames.length));
+  const imagesDirName = `input\\${trainingSteps}_${loraName}`;
   await Promise.all(
     [imagesDirName, "logs", "output"].map((dirName) => fs.mkdir(dirName, { recursive: true }))
   );
@@ -918,46 +1014,65 @@ export const generateLoraTrainingFolderAndParams = async () => {
 
 /* ---------------------- Generate Txt2Img Overrides ---------------------- */
 export const generateTxt2ImgOverrides = async () => {
-  const overrides: Txt2ImgOverrides = {};
+  const overrides: Txt2ImgOverrides = await loadTxt2ImgOverrides();
 
   const booleanPrompt = async (question: string, optName: string) => {
-    const res = (await prompt(chalk.blueBright(`${question} (y/n): `))) as "y" | "n";
+    const res = (await prompt(
+      chalk.blueBright(`${question} (y/n)${makeExistingValueLog(overrides[optName])}`)
+    )) as "y" | "n";
+
     if (res === "y" || res === "n") overrides[optName] = res === "y";
   };
 
-  const numListPrompt = async (label: string, optName: string, options: string[]) => {
+  const numericalPrompt = async (question: string, optName: string) => {
+    const res = await prompt(
+      `${chalk.blueBright(question)}${makeExistingValueLog(overrides[optName])}`
+    );
+
+    if (res.length > 0 && !isNaN(+res)) overrides[optName] = +res;
+  };
+
+  const numListPrompt = async (
+    label: string,
+    optName: string,
+    options: { label: string; value: string }[]
+  ) => {
     const index = +(await prompt(
-      `${chalk.blueBright(`Enter ${label} (1 - ${options.length}):`)}\n${makeConsoleList(
-        options,
+      `${chalk.blueBright(
+        `Enter ${label} (1 - ${options.length})${makeExistingValueLog(overrides[optName])}`
+      )}\n${makeConsoleList(
+        options.map((o) => o.label),
         true
       )}\n`
     ));
 
-    if (index > 0 && index <= options.length) overrides[optName] = options[index - 1];
+    if (index > 0 && index <= options.length) overrides[optName] = options[index - 1].value;
   };
 
-  const numericalPrompt = async (question: string, optName: string) => {
-    const res = await prompt(chalk.blueBright(question));
-    if (res.length > 0 && !isNaN(+res)) overrides[optName] = +res;
-  };
-
-  await numericalPrompt("Enter CFG Scale: ", "cfgScale");
-  await numericalPrompt("Enter Clip Skip: ", "clipSkip");
-  await numericalPrompt("Enter Denoising Strength: ", "denoisingStrength");
-  await numericalPrompt("Enter Hires Scale: ", "hiresScale");
+  await numericalPrompt("Enter CFG Scale", "cfgScale");
+  await numericalPrompt("Enter Clip Skip", "clipSkip");
+  await numericalPrompt("Enter Denoising Strength", "denoisingStrength");
+  await numericalPrompt("Enter Hires Scale", "hiresScale");
+  await numericalPrompt("Enter Hires Steps", "hiresSteps");
   const models = (await listModels()).map((m) => m.name);
-  await numListPrompt("Model", "model", models);
+  await numListPrompt("Model", "model", valsToOpts(models));
   await booleanPrompt("Restore Faces?", "restoreFaces");
   const samplers = await listSamplers();
-  await numListPrompt("Sampler", "sampler", samplers);
-  await numericalPrompt("Enter Seed: ", "seed");
-  await numericalPrompt("Enter Steps: ", "steps");
-  await numericalPrompt("Enter Subseed: ", "subseed");
-  await numericalPrompt("Enter Subseed Strength: ", "subseedStrength");
+  await numListPrompt("Sampler", "sampler", valsToOpts(samplers));
+  await numericalPrompt("Enter Seed", "seed");
+  await numericalPrompt("Enter Steps", "steps");
+  await numericalPrompt("Enter Subseed", "subseed");
+  await numericalPrompt("Enter Subseed Strength", "subseedStrength");
   const upscalers = await listUpscalers();
-  await numListPrompt("Upscaler", "upscaler", upscalers);
+  await numListPrompt("Upscaler", "upscaler", valsToOpts(upscalers));
   const vaes = await listVAEs();
-  await numListPrompt("VAE", "vae", ["None", "Automatic"].concat(vaes.map((v) => v.fileName)));
+  await numListPrompt(
+    "VAE",
+    "vae",
+    valsToOpts(["None", "Automatic"]).concat(
+      vaes.map((v) => ({ label: `${v.fileName} [${v.hash}]`, value: v.hash }))
+    )
+  );
 
   const overridesJson = JSON.stringify(overrides, null, 2);
   await fs.writeFile(TXT2IMG_OVERRIDES_FILE_NAME, overridesJson);
@@ -1145,13 +1260,14 @@ export const segmentByKeywords = async ({
           : true;
 
       if (hasAllRequired && hasAnyRequired) {
-        const dirName = `(${requiredAllKeywords.join(" & ")}) [${requiredAnyKeywords.join(" ~ ")}]`;
+        const dirName = `${requiredAllKeywords.join(" & ")} - ${requiredAnyKeywords.join(" ~ ")}`;
         await fs.mkdir(dirName, { recursive: true });
 
         await Promise.all(
           ["jpg", "txt"].map((ext) => {
-            const fileName = `${imageParams.paramFileName}.${ext}`;
-            return fs.rename(fileName, path.join(dirName, fileName));
+            const filePath = `${imageParams.paramFileName}.${ext}`;
+            const fileName = `${path.basename(imageParams.paramFileName)}.${ext}`;
+            return fs.rename(filePath, path.join(dirName, fileName));
           })
         );
 

@@ -72,6 +72,7 @@ export type Txt2ImgOverrides = {
   cutoffWeight?: number;
   denoisingStrength?: number;
   hiresScale?: number;
+  hiresSteps?: number;
   model?: string;
   negTemplate?: string;
   restoreFaces?: boolean;

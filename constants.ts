@@ -2,7 +2,7 @@ import env from "./env";
 
 export const API_URL = env.API_URL ?? "http://127.0.0.1:7860/sdapi/v1";
 
-export const DEFAULT_BATCH_SIZE = env.DEFAULT_BATCH_SIZE ?? 60;
+export const DEFAULT_BATCH_SIZE = env.DEFAULT_BATCH_SIZE ?? 40;
 
 export const DEFAULT_BATCH_EXCLUDED_PATHS = env.DEFAULT_BATCH_EXCLUDED_PATHS ?? [];
 

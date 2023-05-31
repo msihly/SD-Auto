@@ -1,5 +1,6 @@
 import fs from "fs/promises";
 import { createReadStream } from "fs";
+import { inspect } from "util";
 import { BinaryToTextEncoding, createHash } from "crypto";
 import { createInterface } from "readline";
 import chalk from "chalk";
@@ -24,6 +25,10 @@ export class PromiseQueue {
     return new Promise((resolve, reject) => {
       this.queue = this.queue.then(fn).then(resolve).catch(reject);
     });
+  }
+
+  isPending() {
+    return inspect(this.queue).includes("pending");
   }
 }
 
@@ -142,6 +147,9 @@ export const makeConsoleList = (items: string[], numerical = false) =>
     .map((o, i) => `  ${chalk.blueBright(numerical ? `${i + 1}.` : "•")} ${chalk.white(o)}`)
     .join("\n") + "\n";
 
+export const makeExistingValueLog = (val: string) =>
+  `${val ? ` ${chalk.grey(`(${val})`)}` : ""}${chalk.blueBright(": ")}`;
+
 export const prompt = (query: string, callback?: (answer: string) => void): Promise<string> =>
   new Promise((resolve) =>
     readline.question(query, (answer) => {
@@ -190,3 +198,5 @@ export const sha256File = async (
     fileStream.read(offset);
   });
 };
+
+export const valsToOpts = (vals: string[]) => vals.map((v) => ({ label: v, value: v }));
