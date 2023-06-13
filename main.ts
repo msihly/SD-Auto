@@ -12,6 +12,8 @@ import {
   initAutomatic1111Folders,
   listImageAndParamFileNames,
   listModels,
+  listSamplers,
+  listUpscalers,
   listVAEs,
   pruneFilesFoundInFolders,
   pruneImageParams,
@@ -29,27 +31,21 @@ const SCRIPT_OPTS: {
   label: string;
 }[] = [
   {
-    action: generateBatches,
-    hasRecursiveOption: true,
-    label: "Generate Batches Exhaustively",
-    needsFiles: true,
-  },
-  {
-    action: (fileNames: FileNames) => generateBatches({ ...fileNames, shuffle: true }),
-    hasRecursiveOption: true,
-    label: "Generate Batches Exhaustively (Shuffled)",
-    needsFiles: true,
-  },
-  {
     action: (fileNames: FileNames) => generateImages({ ...fileNames, mode: "upscale" }),
     hasRecursiveOption: true,
     label: "Upscale (Hires Fix)",
     needsFiles: true,
   },
   {
+    action: (fileNames: FileNames) => generateImages({ ...fileNames, mode: "reproduce" }),
+    hasRecursiveOption: true,
+    label: "Reproduce",
+    needsFiles: true,
+  },
+  {
     action: pruneParamsAndSegmentUpscaled,
     hasRecursiveOption: true,
-    label: "Prune Params & Segment by Upscaled",
+    label: "Prune Generation Parameters & Segment by Upscaled",
     needsFiles: true,
   },
   {
@@ -64,9 +60,9 @@ const SCRIPT_OPTS: {
     needsFiles: true,
   },
   {
-    action: segmentByUpscaled,
+    action: segmentByDimensions,
     hasRecursiveOption: true,
-    label: "Segment by Upscaled",
+    label: "Segment by Dimensions",
     needsFiles: true,
   },
   {
@@ -82,15 +78,9 @@ const SCRIPT_OPTS: {
     needsFiles: true,
   },
   {
-    action: segmentByDimensions,
+    action: segmentByUpscaled,
     hasRecursiveOption: true,
-    label: "Segment by Dimensions",
-    needsFiles: true,
-  },
-  {
-    action: (fileNames: FileNames) => generateImages({ ...fileNames, mode: "reproduce" }),
-    hasRecursiveOption: true,
-    label: "Segment by Reproducible",
+    label: "Segment by Upscaled",
     needsFiles: true,
   },
   {
@@ -102,6 +92,18 @@ const SCRIPT_OPTS: {
     action: generateLoraTrainingFolderAndParams,
     label: "Generate Lora Training Folder and Params",
     needsFiles: false,
+  },
+  {
+    action: generateBatches,
+    hasRecursiveOption: true,
+    label: "Generate Batches Exhaustively",
+    needsFiles: true,
+  },
+  {
+    action: (fileNames: FileNames) => generateBatches({ ...fileNames, shuffle: true }),
+    hasRecursiveOption: true,
+    label: "Generate Batches Exhaustively (Shuffled)",
+    needsFiles: true,
   },
   {
     action: convertImagesInCurDirToJPG,
@@ -121,6 +123,16 @@ const SCRIPT_OPTS: {
   {
     action: () => listModels(true, true),
     label: "List Models",
+    needsFiles: false,
+  },
+  {
+    action: () => listSamplers(true, true),
+    label: "List Samplers",
+    needsFiles: false,
+  },
+  {
+    action: () => listUpscalers(true, true),
+    label: "List Upscalers",
     needsFiles: false,
   },
   {
@@ -145,7 +157,7 @@ export const main = async () => {
           }`
       ).join("\n")}\n${chalk.red("  0:")} Exit\n${chalk.blueBright(
         `Select an option ${chalk.grey("(with --r flag for recursion)")}: `
-      )} `
+      )}`
     );
 
     const scriptIndex = +input.replace(/\D+/gi, "");
@@ -165,6 +177,8 @@ export const main = async () => {
     } else script.action();
   } catch (err) {
     console.error(chalk.red(err));
+    console.log(chalk.grey("-".repeat(100)));
+    main();
   }
 };
 

@@ -11,35 +11,40 @@ import cliProgress from "cli-progress";
 import { main } from "./main";
 import {
   API_URL,
-  DEFAULT_BATCH_EXCLUDED_PATHS,
-  DEFAULT_BATCH_SIZE,
-  DEFAULT_HIRES_DENOISING_STRENGTH,
-  DEFAULT_HIRES_SCALE,
-  DEFAULT_HIRES_UPSCALER,
-  DEFAULT_LORA_MODEL,
-  DEFAULT_LORA_PARAMS_PATH,
+  AUTO1111_FOLDER_CONFIG_FILE_NAME,
+  DEFAULTS,
   DIR_NAMES,
-  LORA_TRAINING_PARAMS_FILE_NAME,
+  EXTS,
+  LORA,
   OUTPUT_DIR,
   REPROD_DIFF_TOLERANCE,
   TXT2IMG_OVERRIDES_FILE_NAME,
   VAE_DIR,
 } from "./constants";
 import {
+  Auto1111FolderConfig,
+  Auto1111FolderName,
   FileNames,
   ImageFileNames,
+  ImageParams,
   LoraTrainingParams,
   Model,
   NoEmit,
   ParamFileNames,
+  Txt2ImgMode,
+  Txt2ImgOverrideGroup,
   Txt2ImgOverrides,
+  Txt2ImgRequest,
+  VAE,
 } from "./types";
 import {
   Image,
   PromiseQueue,
+  TreeNode,
   chunkArray,
   compareImage,
   convertImagesToJPG,
+  createTree,
   delimit,
   dirToFilePaths,
   doesPathExist,
@@ -57,8 +62,13 @@ import {
 /* -------------------------------------------------------------------------- */
 /*                                    UTILS                                   */
 /* -------------------------------------------------------------------------- */
+const extendFileName = (fileName: string) => ({
+  imageFileName: `${fileName}.${EXTS.IMAGE}`,
+  paramFileName: `${fileName}.${EXTS.PARAMS}`,
+});
+
 /* ------------------------------ Main Emitter ------------------------------ */
-export const mainEmitter = new EventEmitter();
+const mainEmitter = new EventEmitter();
 
 mainEmitter.on("done", () => {
   setTimeout(() => {
@@ -68,7 +78,12 @@ mainEmitter.on("done", () => {
 });
 
 /* ------------------------- Automatic1111 REST API ------------------------- */
-const apiCall = async (method: "GET" | "POST", endpoint: string, config?: AxiosRequestConfig) => {
+const apiCall = async (
+  method: "GET" | "POST",
+  endpoint: string,
+  config?: AxiosRequestConfig,
+  withThrow = false
+) => {
   try {
     const res = await axios({ method, url: `${API_URL}/${endpoint}`, ...config });
     return { success: true, data: res?.data };
@@ -76,14 +91,16 @@ const apiCall = async (method: "GET" | "POST", endpoint: string, config?: AxiosR
     const errMsg = err.message.includes("ECONNREFUSED")
       ? "Automatic1111 server is not connected. Start server to use this command."
       : err.stack;
-    console.error(chalk.red(errMsg));
+
+    if (withThrow) throw new Error(errMsg);
+    else console.error(chalk.red(errMsg));
 
     mainEmitter.emit("done");
     return { success: false, error: errMsg };
   }
 };
 
-export const API = {
+const API = {
   Auto1111: {
     get: (endpoint: string, config?: AxiosRequestConfig) => apiCall("GET", endpoint, config),
     post: (endpoint: string, config?: AxiosRequestConfig) => apiCall("POST", endpoint, config),
@@ -93,12 +110,7 @@ export const API = {
 /* ---------------------------- Get Active Model ---------------------------- */
 export const getActiveModel = async (withConsole = false, withEmit = false) => {
   const res = await API.Auto1111.get("options");
-  if (!res.success) {
-    if (withEmit) {
-      mainEmitter.emit("done");
-      return;
-    } else throw new Error(res.error);
-  }
+  if (!res.success) return;
 
   const model = (res.data?.sd_model_checkpoint as string)
     .replace(/\\/gi, "_")
@@ -112,12 +124,7 @@ export const getActiveModel = async (withConsole = false, withEmit = false) => {
 /* ---------------------------- Get Active VAE ---------------------------- */
 export const getActiveVAE = async (withConsole = false, withEmit = false) => {
   const res = await API.Auto1111.get("options");
-  if (!res.success) {
-    if (withEmit) {
-      mainEmitter.emit("done");
-      return;
-    } else throw new Error(res.error);
-  }
+  if (!res.success) return;
 
   const vae = (res.data?.sd_vae as string).trim();
   if (withConsole) console.log("Active VAE: ", chalk.cyan(vae));
@@ -129,10 +136,7 @@ export const getActiveVAE = async (withConsole = false, withEmit = false) => {
 export const interruptGeneration = async (withConsole = false) => {
   if (withConsole) console.log(chalk.yellow("Interrupting generation..."));
   const res = await API.Auto1111.post("interrupt");
-  if (withConsole) {
-    if (!res.success) throw new Error(res.error);
-    else console.log(chalk.green("Generation interrupted!"));
-  }
+  if (withConsole && res.success) console.log(chalk.green("Generation interrupted!"));
 };
 
 /* -------------- Get Image and Generatiom Parameter File Names ------------- */
@@ -154,9 +158,9 @@ export const listImageAndParamFileNames = async (withRecursiveFiles = false) => 
   const [imageFileNames, paramFileNames] = files.reduce(
     (acc, cur) => {
       const fileName = cur.substring(0, cur.lastIndexOf("."));
-      const ext = cur.substring(cur.lastIndexOf("."));
-      if (ext === ".jpg") acc[0].push(fileName);
-      else if (ext === ".txt") acc[1].push(fileName);
+      const ext = cur.substring(cur.lastIndexOf(".") + 1);
+      if (ext === EXTS.IMAGE) acc[0].push(fileName);
+      else if (ext === EXTS.PARAMS) acc[1].push(fileName);
       return acc;
     },
     [[], []] as string[][]
@@ -172,7 +176,7 @@ export const listImageAndParamFileNames = async (withRecursiveFiles = false) => 
 };
 
 /* ---------------------- List Images Found In Other Folders --------------------- */
-export const listImagesFoundInOtherFolders = ({
+const listImagesFoundInOtherFolders = ({
   imageFileNames,
   imagesInOtherFolders,
   withConsole = false,
@@ -199,18 +203,13 @@ export const listImagesFoundInOtherFolders = ({
 /* ---------------------- List Models ---------------------- */
 export const listModels = async (withConsole = false, withEmit = false) => {
   const res = await API.Auto1111.get("sd-models");
-  if (!res.success) {
-    if (withEmit) {
-      mainEmitter.emit("done");
-      return;
-    } else throw new Error(res.error);
-  }
+  if (!res.success) return;
 
   const models = res.data?.map((m) => ({
     hash: m.hash,
     name: m.model_name.replace(/,|^(\n|\r|\s)|(\n|\r|\s)$/gim, ""),
     path: m.filename,
-  })) as { hash: string; name: string; path: string }[];
+  })) as Model[];
   if (withConsole)
     console.log(`Models:\n${chalk.cyan(makeConsoleList(models.map((m) => m.name)))}`);
   if (withEmit) mainEmitter.emit("done");
@@ -220,12 +219,7 @@ export const listModels = async (withConsole = false, withEmit = false) => {
 /* ---------------------- List Samplers ---------------------- */
 export const listSamplers = async (withConsole = false, withEmit = false) => {
   const res = await API.Auto1111.get("samplers");
-  if (!res.success) {
-    if (withEmit) {
-      mainEmitter.emit("done");
-      return;
-    } else throw new Error(res.error);
-  }
+  if (!res.success) return;
 
   const samplers = res?.data?.map((s) => s.name) as string[];
   if (withConsole) console.log(`Samplers:\n${chalk.cyan(makeConsoleList(samplers))}`);
@@ -236,12 +230,7 @@ export const listSamplers = async (withConsole = false, withEmit = false) => {
 /* ---------------------- List Upscalers ---------------------- */
 export const listUpscalers = async (withConsole = false, withEmit = false) => {
   const res = await API.Auto1111.get("upscalers");
-  if (!res.success) {
-    if (withEmit) {
-      mainEmitter.emit("done");
-      return;
-    } else throw new Error(res.error);
-  }
+  if (!res.success) return;
 
   const upscalers = res?.data?.map((s) => s.name) as string[];
   if (withConsole) console.log(`Upscalers:\n${chalk.cyan(makeConsoleList(upscalers))}`);
@@ -283,30 +272,85 @@ export const listVAEs = async (withConsole = false, withEmit = false) => {
   return vaes;
 };
 
-/* --------------------- Load Txt2Img Generation Overrides From File --------------------- */
-export const loadTxt2ImgOverrides = async (dirPath: string = ".") => {
+/* --------------------- Load Txt2Img Generation Overrides From Files / Folders --------------------- */
+const createOverridesTreeNode = async (
+  treeNode: TreeNode,
+  tree: Txt2ImgOverrideGroup[],
+  parentPath: string,
+  parentOverrides: Txt2ImgOverrides
+) => {
+  const fullPath = parentPath ? path.join(parentPath, treeNode.name) : treeNode.name;
+  const dirPath = path.extname(fullPath).length > 0 ? path.dirname(fullPath) : fullPath;
+  const overrides = { ...parentOverrides, ...(await loadTxt2ImgOverrides(dirPath)) };
+
+  const dirNode = tree.find((t) => t.dirPath === dirPath);
+  if (fullPath !== dirPath) {
+    const fileName = path.basename(fullPath);
+    if (dirNode) dirNode.fileNames.push(fileName);
+    else tree.push({ dirPath, overrides, fileNames: [fileName] });
+  } else if (!dirNode) tree.push({ dirPath, overrides, fileNames: [] });
+
+  if (treeNode.children.length > 0)
+    await Promise.all(
+      treeNode.children.map((node) => createOverridesTreeNode(node, tree, fullPath, overrides))
+    );
+};
+
+const createOverridesTree = async (filePaths: string[]) => {
+  const dirTree = createTree(filePaths);
+
+  const overrideTree = [
+    { dirPath: ".", fileNames: [], overrides: await loadTxt2ImgOverrides() },
+  ] as Txt2ImgOverrideGroup[];
+
+  await Promise.all(
+    dirTree.map((treeNode) =>
+      createOverridesTreeNode(treeNode, overrideTree, ".", overrideTree[0].overrides)
+    )
+  );
+
+  return overrideTree.reduce((acc, cur) => {
+    if (!cur.fileNames.length) return acc;
+
+    acc.push({
+      filePaths: cur.fileNames.map((fileName) => path.join(cur.dirPath, fileName)),
+      overrides: cur.overrides,
+    });
+    return acc;
+  }, [] as { filePaths: string[]; overrides: object }[]);
+};
+
+const loadTxt2ImgOverrides = async (dirPath: string = ".") => {
   try {
     const filePath = path.resolve(dirPath, TXT2IMG_OVERRIDES_FILE_NAME);
-    const fileExists = await doesPathExist(filePath);
-    if (!fileExists) return {};
-    else
-      return JSON.parse(
-        await fs.readFile(path.resolve(dirPath, TXT2IMG_OVERRIDES_FILE_NAME), {
-          encoding: "utf8",
-        })
-      ) as Txt2ImgOverrides;
+    if (!(await doesPathExist(filePath))) return {};
+    else return JSON.parse(await fs.readFile(filePath, { encoding: "utf8" })) as Txt2ImgOverrides;
   } catch (err) {
     console.error(chalk.red("Error reading txt2img overrides: ", err.stack));
     return {};
   }
 };
 
-/* --------------------- Load Lora Training Params From File --------------------- */
-export const loadLoraTrainingParams = async (paramFilePath: string) => {
+/* --------------------- Load Auto111 Folder Config --------------------- */
+const loadAuto1111FolderConfig = async (dirPath: string = ".") => {
   try {
-    const res = await fs.readFile(paramFilePath, { encoding: "utf8" });
-    return JSON.parse(res) as LoraTrainingParams;
+    const filePath = path.resolve(dirPath, AUTO1111_FOLDER_CONFIG_FILE_NAME);
+    if (!(await doesPathExist(filePath))) return {};
+    else
+      return JSON.parse(await fs.readFile(filePath, { encoding: "utf8" })) as Auto1111FolderConfig;
   } catch (err) {
+    console.error(chalk.red("Error reading Automatic1111 folder config: ", err.stack));
+    return {};
+  }
+};
+
+/* --------------------- Load Lora Training Params From File --------------------- */
+const loadLoraTrainingParams = async (filePath: string) => {
+  try {
+    if (!(await doesPathExist(filePath))) return {};
+    else return JSON.parse(await fs.readFile(filePath, { encoding: "utf8" })) as LoraTrainingParams;
+  } catch (err) {
+    console.error(chalk.red("Error reading lora training params: ", err.stack));
     return {};
   }
 };
@@ -316,7 +360,7 @@ export const makeTimeLog = (time: number) =>
   `${chalk.green(dayjs.duration(time).format("H[h]m[m]s[s]"))} ${chalk.grey(`(${round(time)}ms)`)}`;
 
 /* -------------------- Parse Image Generation Parameter -------------------- */
-export const parseImageParam = <IsNum extends boolean>(
+const parseImageParam = <IsNum extends boolean>(
   imageParams: string,
   paramName: string,
   isNumber: IsNum,
@@ -328,7 +372,7 @@ export const parseImageParam = <IsNum extends boolean>(
     const hasParam = imageParams.includes(`${paramName}: `);
     if (!hasParam) {
       if (!optional)
-        throw new Error(`Param "${paramName}" not found in image params: ${imageParams}.`);
+        throw new Error(`Param "${paramName}" not found in generation parameters: ${imageParams}.`);
       return undefined;
     }
 
@@ -353,7 +397,7 @@ export const parseImageParam = <IsNum extends boolean>(
 };
 
 /* ----------------- Parse Image Generation Parameters File ----------------- */
-export const parseImageParams = async ({
+const parseImageParams = async ({
   models,
   overrides,
   paramFileName,
@@ -362,7 +406,12 @@ export const parseImageParams = async ({
   overrides?: Txt2ImgOverrides;
   paramFileName: string;
 }) => {
-  const imageParams = await fs.readFile(`${paramFileName}.txt`, { encoding: "utf8" });
+  const fileName = path.join(
+    path.dirname(paramFileName),
+    path.basename(paramFileName, path.extname(paramFileName))
+  );
+
+  const imageParams = await fs.readFile(`${fileName}.${EXTS.PARAMS}`, { encoding: "utf8" });
 
   const negPromptEndIndex = imageParams.indexOf("Steps: ");
   let negPromptStartIndex = imageParams.indexOf("Negative prompt: ");
@@ -391,11 +440,12 @@ export const parseImageParams = async ({
   const cfgScale = overrides?.cfgScale ?? parseImageParam(restParams, "CFG scale", true);
   const clipSkip = overrides?.clipSkip ?? parseImageParam(restParams, "Clip skip", true, true);
   const hasRestoreFaces = overrides?.restoreFaces ?? !!restParams.includes("Face restoration");
-  const hiresDenoisingStrength = overrides?.denoisingStrength ?? DEFAULT_HIRES_DENOISING_STRENGTH;
-  const hiresScale = overrides?.hiresScale ?? DEFAULT_HIRES_SCALE;
+  const hiresDenoisingStrength =
+    overrides?.hiresDenoisingStrength ?? DEFAULTS.HIRES_DENOISING_STRENGTH;
+  const hiresScale = overrides?.hiresScale ?? DEFAULTS.HIRES_SCALE;
   const hiresSteps =
     overrides?.hiresSteps ?? parseImageParam(restParams, "Hires steps", true, true);
-  const hiresUpscaler = overrides?.upscaler ?? DEFAULT_HIRES_UPSCALER;
+  const hiresUpscaler = overrides?.hiresUpscaler ?? DEFAULTS.HIRES_UPSCALER;
   const sampler = overrides?.sampler ?? parseImageParam(restParams, "Sampler", false);
   const seed = overrides?.seed ?? parseImageParam(restParams, "Seed", true);
   const steps = overrides?.steps ?? parseImageParam(restParams, "Steps", true);
@@ -455,6 +505,7 @@ export const parseImageParams = async ({
     cutoffDisableForNeg,
     cutoffStrong,
     cutoffInterpolation,
+    fileName,
     hasRestoreFaces,
     height,
     hiresDenoisingStrength,
@@ -464,7 +515,6 @@ export const parseImageParams = async ({
     model,
     negPrompt,
     negTemplate,
-    paramFileName,
     prompt,
     rawParams: imageParams,
     sampler,
@@ -479,38 +529,29 @@ export const parseImageParams = async ({
 };
 
 /* -------------- Parse and Sort Image Parameter Files by Model ------------- */
-export const parseAndSortImageParams = async ({ imageFileNames, paramFileNames }: FileNames) => {
+const parseAndSortImageParams = async (fileNames: FileNames): Promise<ImageParams[]> => {
+  let { imageFileNames, paramFileNames } = fileNames;
+
   if (paramFileNames.length > imageFileNames.length) {
     console.log(
       `Pruning ${chalk.yellow(
         paramFileNames.length - imageFileNames.length
       )} unused generation parameters...`
     );
-    await pruneImageParams({ imageFileNames, paramFileNames });
+    const prunedParams = await pruneImageParams({ imageFileNames, paramFileNames });
+    paramFileNames = fileNames.paramFileNames.filter((p) => !prunedParams.includes(p));
   }
 
-  console.log("Parsing and sorting image params...");
+  console.log("Parsing and sorting generation parameters...");
   const models = await listModels();
 
-  const dirGroups = paramFileNames.reduce((acc, cur) => {
-    const dirPath = path.dirname(cur);
-    const dirGroup = acc.find((a) => a.dirPath === dirPath);
-    if (dirGroup) dirGroup.fileNames.push(cur);
-    else acc.push({ dirPath, fileNames: [cur] });
-    return acc;
-  }, [] as { dirPath: string; fileNames: string[]; overrides?: Txt2ImgOverrides }[]);
-
-  await Promise.all(
-    dirGroups.map(async (d) => {
-      d.overrides = await loadTxt2ImgOverrides(d.dirPath);
-    })
-  );
+  const overridesTree = await createOverridesTree(paramFileNames.map((f) => `${f}.${EXTS.PARAMS}`));
 
   const allImageParams = (
     await Promise.all(
-      dirGroups.flatMap(({ overrides, fileNames }) =>
-        fileNames.map((fileName) =>
-          parseImageParams({ models, overrides, paramFileName: fileName })
+      overridesTree.flatMap(({ overrides, filePaths }) =>
+        filePaths.map((filePath) =>
+          parseImageParams({ models, overrides, paramFileName: filePath })
         )
       )
     )
@@ -521,26 +562,26 @@ export const parseAndSortImageParams = async ({ imageFileNames, paramFileNames }
     return a.model.localeCompare(b.model);
   });
 
-  console.log(chalk.green("Image params parsed and sorted."));
+  console.log(chalk.green("Generation parameters parsed and sorted."));
   return allImageParams;
 };
 
 /* ----------------------- Prompt For Batch Generation Parameters ---------------------- */
-export const promptForBatchParams = async ({ imageFileNames }: ImageFileNames) => {
+const promptForBatchParams = async ({ imageFileNames }: ImageFileNames) => {
   const folderName = await prompt(chalk.blueBright(`Enter folder name: `));
 
   let excludedPaths = delimit(
     await prompt(
       chalk.blueBright(
         `Enter folder paths to exclude (delineated by |) ${chalk.grey(
-          `(${DEFAULT_BATCH_EXCLUDED_PATHS.join(" | ")})`
+          `(${DEFAULTS.BATCH_EXCLUDED_PATHS.join(" | ")})`
         )}: `
       )
     ),
     "|"
   );
 
-  if (!excludedPaths.length) excludedPaths = DEFAULT_BATCH_EXCLUDED_PATHS;
+  if (!excludedPaths.length) excludedPaths = DEFAULTS.BATCH_EXCLUDED_PATHS;
 
   const imagesInOtherFolders =
     excludedPaths.length > 0 ? await getImagesInFolders({ paths: excludedPaths }) : null;
@@ -554,8 +595,8 @@ export const promptForBatchParams = async ({ imageFileNames }: ImageFileNames) =
 
   const batchSize =
     +(await prompt(
-      `${chalk.blueBright("Enter batch size")} ${chalk.grey(`(${DEFAULT_BATCH_SIZE})`)}:`
-    )) || DEFAULT_BATCH_SIZE;
+      `${chalk.blueBright("Enter batch size")} ${chalk.grey(`(${DEFAULTS.BATCH_SIZE})`)}:`
+    )) || DEFAULTS.BATCH_SIZE;
 
   const filesNotInOtherFolders =
     excludedPaths.length > 0
@@ -569,32 +610,31 @@ export const promptForBatchParams = async ({ imageFileNames }: ImageFileNames) =
 };
 
 /* ---------------------------- Remap Model Name ---------------------------- */
-export const remapModelName = (models: { hash: string; name: string }[], modelHash: string) =>
+const remapModelName = (models: { hash: string; name: string }[], modelHash: string) =>
   models.find((m) => m.hash === modelHash)?.name;
 
 /* ----------------------------- Refresh Models ----------------------------- */
-export const refreshModels = async () => {
+const refreshModels = async () => {
   console.log("Refreshing models...");
   const res = await API.Auto1111.post("refresh-checkpoints");
-  if (!res.success) throw new Error(res.error);
-  console.log(chalk.green("Models refreshed."));
+  if (res.success) console.log(chalk.green("Models refreshed."));
 };
 
 /* ---------------------------- Set Active Model ---------------------------- */
-export const setActiveModel = async (modelName: string) => {
+const setActiveModel = async (modelName: string) => {
   const res = await API.Auto1111.post("options", { data: { sd_model_checkpoint: modelName } });
-  if (!res.success) throw new Error(res.error);
+  if (!res.success) return;
 };
 
 /* ---------------------------- Set Active VAE ---------------------------- */
-export const setActiveVAE = async (vaeName: "None" | "Automatic" | string) => {
+const setActiveVAE = async (vaeName: "None" | "Automatic" | string) => {
   /** Current bug with setting VAE that requires switching to another VAE or checkpoint before switching to desired VAE, otherwise will not take effect. */
   let res = await API.Auto1111.post("options", { data: { sd_vae: vaeName } });
-  if (!res.success) throw new Error(res.error);
+  if (!res.success) return;
   res = await API.Auto1111.post("options", { data: { sd_vae: "None" } });
-  if (!res.success) throw new Error(res.error);
+  if (!res.success) return;
   res = await API.Auto1111.post("options", { data: { sd_vae: vaeName } });
-  if (!res.success) throw new Error(res.error);
+  if (!res.success) return;
 };
 
 /* -------------------------------------------------------------------------- */
@@ -603,7 +643,7 @@ export const setActiveVAE = async (vaeName: "None" | "Automatic" | string) => {
 /* --------------- Convert Images in Current Directory to JPG --------------- */
 export const convertImagesInCurDirToJPG = async () => {
   const nonJPG = (await fs.readdir(".")).filter(
-    (fileName) => ![".jpg", ".txt"].includes(path.extname(fileName))
+    (fileName) => ![EXTS.IMAGE, EXTS.PARAMS].includes(path.extname(fileName).substring(1))
   );
   await convertImagesToJPG(nonJPG);
 
@@ -641,7 +681,7 @@ export const generateBatches = async ({
       await Promise.all(
         batch.fileNames.map(async (name) => {
           try {
-            const fileName = `${name}.jpg`;
+            const fileName = `${name}.${EXTS.IMAGE}`;
             await fs.copyFile(fileName, path.join(batch.folderName, path.basename(fileName)));
             console.log(`Moved ${chalk.cyan(name)} to ${chalk.magenta(batch.folderName)}.`);
           } catch (err) {
@@ -663,8 +703,8 @@ export const generateBatches = async ({
   if (!noEmit) mainEmitter.emit("done");
 };
 
-/* ------------------------- Generate Images (Hires Fix / Segment by Reproducible) ------------------------ */
-export class GenerationQueue extends PromiseQueue {
+/* ------------------------- Generate Images (Hires Fix / Reproduce) ------------------------ */
+class GenerationQueue extends PromiseQueue {
   activeModel: string = null;
 
   activeVAEHash: string = null;
@@ -680,10 +720,45 @@ export class GenerationQueue extends PromiseQueue {
 
   progressInterval: NodeJS.Timer = null;
 
-  endProgress() {
-    clearInterval(this.progressInterval);
-    this.progressInterval = null;
-    this.progress.stop();
+  createTxt2ImgRequest(imageParams: ImageParams, mode: Txt2ImgMode): Txt2ImgRequest {
+    return {
+      alwayson_scripts: {
+        Cutoff: imageParams.cutoffEnabled
+          ? {
+              args: [
+                imageParams.cutoffEnabled,
+                imageParams.cutoffTargets.join(", "),
+                imageParams.cutoffWeight,
+                imageParams.cutoffDisableForNeg,
+                imageParams.cutoffStrong,
+                imageParams.cutoffPadding,
+                imageParams.cutoffInterpolation,
+                false, // debug output
+              ],
+            }
+          : undefined,
+      },
+      cfg_scale: imageParams.cfgScale,
+      denoising_strength: imageParams.hiresDenoisingStrength,
+      enable_hr: mode === "upscale",
+      height: imageParams.height,
+      hr_scale: imageParams.hiresScale,
+      hr_steps: imageParams.hiresSteps,
+      hr_upscaler: imageParams.hiresUpscaler,
+      negative_prompt: imageParams.negPrompt,
+      override_settings: { CLIP_stop_at_last_layers: imageParams.clipSkip ?? 1 },
+      override_settings_restore_afterwards: true,
+      prompt: imageParams.prompt,
+      restore_faces: imageParams.restoreFaces,
+      sampler_name: imageParams.sampler,
+      save_images: false,
+      seed: imageParams.seed,
+      send_images: true,
+      steps: imageParams.steps,
+      subseed: imageParams.subseed ?? -1,
+      subseed_strength: imageParams.subseedStrength ?? 0,
+      width: imageParams.width,
+    };
   }
 
   getActiveModel() {
@@ -706,21 +781,155 @@ export class GenerationQueue extends PromiseQueue {
     this.activeVAEHash = vae;
   }
 
-  async startProgress() {
+  startProgress() {
     this.progress.start(1, 0, { formattedETA: "N/A" });
 
     this.progressInterval = setInterval(async () => {
       const res = await API.Auto1111.get("progress");
-      if (!res.success) console.debug("Failed to update progress.");
-      else
-        this.progress.update(res.data.progress, {
-          formattedETA: `${round(+res.data.eta_relative)}s`,
-        });
-    }, 1000);
+      if (!res.success) return;
+      this.progress.update(res.data.progress, {
+        formattedETA: `${round(+res.data.eta_relative)}s`,
+      });
+    }, 750);
+  }
+
+  stopProgress() {
+    clearInterval(this.progressInterval);
+    this.progressInterval = null;
+    this.progress.stop();
+  }
+
+  private async txt2Img(txt2ImgRequest: Txt2ImgRequest, imageParams: ImageParams) {
+    const res = await API.Auto1111.post("txt2img", {
+      headers: { "Content-Type": "application/json" },
+      data: txt2ImgRequest,
+    });
+    if (!res.success) throw new Error(res.error);
+
+    const { negTemplate, template } = imageParams;
+    return {
+      imageBuffer: Buffer.from(res.data?.images[0], "base64"),
+      params:
+        (JSON.parse(res.data?.info).infotexts[0] as string) +
+        (template ? `\nTemplate: ${template}` : "") +
+        (negTemplate ? `\nNegative Template: ${negTemplate}` : ""),
+    };
+  }
+
+  async reproduce(txt2ImgRequest: Txt2ImgRequest, imageParams: ImageParams) {
+    GenQueue.startProgress();
+
+    const { imageFileName, paramFileName } = extendFileName(imageParams.fileName);
+    const res = await this.txt2Img(txt2ImgRequest, imageParams);
+
+    const { percentDiff, pixelDiff } = await compareImage(imageFileName, res.imageBuffer);
+    const isReproducible = percentDiff < REPROD_DIFF_TOLERANCE;
+    const chalkColor = isReproducible ? "green" : "yellow";
+    console.log(
+      `\nPixel Diff: ${chalk[chalkColor](pixelDiff)}. Percent diff: ${
+        chalk[chalkColor](round(percentDiff * 100)) + "%"
+      }.`
+    );
+
+    const parentDir = path.join(
+      path.dirname(imageFileName),
+      isReproducible ? DIR_NAMES.reproducible : DIR_NAMES.nonReproducible
+    );
+    const productsDir = path.join(parentDir, DIR_NAMES.products);
+    await fs.mkdir(productsDir, { recursive: true });
+
+    await Promise.all([
+      fs.writeFile(path.join(productsDir, path.basename(imageFileName)), res.imageBuffer),
+      fs.writeFile(path.join(productsDir, path.basename(paramFileName)), res.params),
+    ]);
+
+    await Promise.all(
+      [imageFileName, paramFileName].map((fileName) =>
+        fs.rename(fileName, path.join(parentDir, path.basename(fileName)))
+      )
+    );
+
+    GenQueue.stopProgress();
+
+    console.log(
+      `\n${chalk.cyan(imageParams.fileName)} moved to ${chalk[isReproducible ? "green" : "yellow"](
+        parentDir
+      )}.`
+    );
+  }
+
+  async upscale(txt2ImgRequest: Txt2ImgRequest, imageParams: ImageParams) {
+    GenQueue.startProgress();
+
+    const outputDir = DIR_NAMES.upscaled;
+    const sourcesDir = DIR_NAMES.upscaleCompleted;
+    await Promise.all([outputDir, sourcesDir].map((dir) => fs.mkdir(dir, { recursive: true })));
+
+    const { imageFileName, paramFileName } = extendFileName(imageParams.fileName);
+    const res = await this.txt2Img(txt2ImgRequest, imageParams);
+    await Promise.all([
+      fs.writeFile(path.join(outputDir, path.basename(imageFileName)), res.imageBuffer),
+      fs.writeFile(path.join(outputDir, path.basename(paramFileName)), res.params),
+    ]);
+
+    await Promise.all(
+      [imageFileName, paramFileName].map((fileName) =>
+        fs.rename(fileName, path.join(sourcesDir, path.basename(fileName)))
+      )
+    );
+
+    GenQueue.stopProgress();
+  }
+
+  async switchModelIfNeeded(modelName: string, models: Model[], fileName: string) {
+    if (modelName !== this.getActiveModel()) {
+      if (!models.map((m) => m.name).includes(modelName))
+        throw new Error(`Model ${chalk.magenta(modelName)} does not exist. Skipping ${fileName}.`);
+
+      console.log(`Setting active model to ${chalk.magenta(modelName)}...`);
+      await setActiveModel(modelName);
+      this.setActiveModel(modelName);
+
+      console.log(chalk.green("Active model updated."));
+    }
+  }
+
+  async switchVAEIfNeeded(vaeHash: string, vaes: VAE[]) {
+    const activeVAEHash = this.getActiveVAEHash();
+    if (vaeHash !== activeVAEHash) {
+      if (
+        ["Automatic", "None"].includes(vaeHash) &&
+        !["Automatic", "None"].includes(activeVAEHash)
+      ) {
+        console.log(`Setting active VAE to ${chalk.magenta(vaeHash)}...`);
+        await setActiveVAE(vaeHash);
+        this.setActiveVAEHash(vaeHash);
+      } else {
+        const vae = vaes.find((v) => v.hash === vaeHash);
+        if (!vae) {
+          console.warn(
+            chalk.yellow(
+              `VAE with hash ${chalk.magenta(
+                vaeHash
+              )} does not exist. Setting active VAE to ${chalk.magenta("None")}...`
+            )
+          );
+
+          await setActiveVAE("None");
+          this.setActiveVAEHash("None");
+        } else {
+          console.log(`Setting active VAE to ${chalk.magenta(`${vae.fileName} (${vae.hash})`)}...`);
+          await setActiveVAE(vae.fileName);
+          this.setActiveVAEHash(vae.hash);
+        }
+      }
+
+      console.log(chalk.green("Active VAE updated."));
+    }
   }
 }
 
-export const GenQueue = new GenerationQueue();
+const GenQueue = new GenerationQueue();
 
 exitHook(async (callback) => {
   if (GenQueue.isPending()) await interruptGeneration(true);
@@ -731,7 +940,7 @@ export const generateImages = async ({
   mode,
   imageFileNames,
   paramFileNames,
-}: FileNames & { mode: "reproduce" | "upscale" }) => {
+}: FileNames & { mode: Txt2ImgMode }) => {
   try {
     const perfStart = performance.now();
 
@@ -749,187 +958,32 @@ export const generateImages = async ({
 
     let completedCount = 0;
     const totalCount = allImageParams.length;
+    if (totalCount === 0) mainEmitter.emit("done");
 
     allImageParams.forEach((imageParams) =>
       GenQueue.add(async () => {
         try {
-          if (!imageFileNames.find((fileName) => fileName === imageParams.paramFileName)) {
-            throw new Error(
-              `Image for ${chalk.yellow(imageParams.paramFileName)} does not exist. Skipping.`
-            );
-          }
-
           const iterationPerfStart = performance.now();
 
-          const requestBody = {
-            alwayson_scripts: {
-              Cutoff: imageParams.cutoffEnabled
-                ? {
-                    args: [
-                      imageParams.cutoffEnabled,
-                      imageParams.cutoffTargets.join(", "),
-                      imageParams.cutoffWeight,
-                      imageParams.cutoffDisableForNeg,
-                      imageParams.cutoffStrong,
-                      imageParams.cutoffPadding,
-                      imageParams.cutoffInterpolation,
-                      false, // debug output
-                    ],
-                  }
-                : undefined,
-            },
-            cfg_scale: imageParams.cfgScale,
-            denoising_strength: imageParams.hiresDenoisingStrength,
-            enable_hr: mode === "upscale",
-            height: imageParams.height,
-            hr_scale: imageParams.hiresScale,
-            hr_steps: imageParams.hiresSteps,
-            hr_upscaler: imageParams.hiresUpscaler,
-            negative_prompt: imageParams.negPrompt,
-            override_settings: { CLIP_stop_at_last_layers: imageParams.clipSkip ?? 1 },
-            override_settings_restore_afterwards: true,
-            prompt: imageParams.prompt,
-            restore_faces: imageParams.hasRestoreFaces,
-            sampler_name: imageParams.sampler,
-            save_images: false,
-            seed: imageParams.seed,
-            send_images: true,
-            steps: imageParams.steps,
-            subseed: imageParams.subseed ?? -1,
-            subseed_strength: imageParams.subseedStrength ?? 0,
-            width: imageParams.width,
-          };
+          const { fileName, model, vaeHash } = imageParams;
+          if (!imageFileNames.find((f) => f === fileName)) {
+            throw new Error(`Image for ${chalk.yellow(fileName)} does not exist. Skipping.`);
+          }
 
+          const txt2ImgRequest = GenQueue.createTxt2ImgRequest(imageParams, mode);
           console.log(
             `${mode === "upscale" ? "Upscaling" : "Reproducing"} ${chalk.cyan(
-              imageParams.paramFileName
+              fileName
             )} with params:`,
-            chalk.cyan(JSON.stringify(requestBody, null, 2))
+            chalk.cyan(JSON.stringify(txt2ImgRequest, null, 2))
           );
 
-          if (imageParams.model !== GenQueue.getActiveModel()) {
-            if (!modelNames.map((m) => m.name).includes(imageParams.model)) {
-              throw new Error(
-                `Model ${chalk.magenta(imageParams.model)} does not exist. Skipping ${
-                  imageParams.paramFileName
-                }.`
-              );
-            }
+          await GenQueue.switchModelIfNeeded(model, modelNames, fileName);
+          await GenQueue.switchVAEIfNeeded(vaeHash, vaes);
 
-            console.log(`Setting active model to ${chalk.magenta(imageParams.model)}...`);
-            await setActiveModel(imageParams.model);
-            GenQueue.setActiveModel(imageParams.model);
+          if (mode === "reproduce") await GenQueue.reproduce(txt2ImgRequest, imageParams);
+          else await GenQueue.upscale(txt2ImgRequest, imageParams);
 
-            console.log(chalk.green("Active model updated."));
-          }
-
-          const activeVAEHash = GenQueue.getActiveVAEHash();
-          if (imageParams.vaeHash !== activeVAEHash) {
-            if (
-              ["Automatic", "None"].includes(imageParams.vaeHash) &&
-              !["Automatic", "None"].includes(activeVAEHash)
-            ) {
-              console.log(`Setting active VAE to ${chalk.magenta(imageParams.vaeHash)}...`);
-              await setActiveVAE(imageParams.vaeHash);
-              GenQueue.setActiveVAEHash(imageParams.vaeHash);
-            } else {
-              const vae = vaes.find((v) => v.hash === imageParams.vaeHash);
-              if (!vae) {
-                console.warn(
-                  chalk.yellow(
-                    `VAE with hash ${chalk.magenta(
-                      imageParams.vaeHash
-                    )} does not exist. Setting active VAE to ${chalk.magenta("None")}...`
-                  )
-                );
-
-                await setActiveVAE("None");
-                GenQueue.setActiveVAEHash("None");
-              } else {
-                console.log(
-                  `Setting active VAE to ${chalk.magenta(`${vae.fileName} (${vae.hash})`)}...`
-                );
-                await setActiveVAE(vae.fileName);
-                GenQueue.setActiveVAEHash(vae.hash);
-              }
-            }
-
-            console.log(chalk.green("Active VAE updated."));
-          }
-
-          console.log(`Beginning ${mode === "upscale" ? "upscale" : "reproduction"}...`);
-          GenQueue.startProgress();
-
-          const res = await API.Auto1111.post("txt2img", {
-            headers: { "Content-Type": "application/json" },
-            data: requestBody,
-          });
-          if (!res.success) throw new Error(res.error);
-
-          const genImageBuffer = Buffer.from(res.data?.images[0], "base64");
-          const genParams =
-            (JSON.parse(res.data?.info).infotexts[0] as string) +
-            (imageParams.template ? `\nTemplate: ${imageParams.template}` : "") +
-            (imageParams.negTemplate ? `\nNegative Template: ${imageParams.negTemplate}` : "");
-
-          const [imageFileName, paramFileName] = ["jpg", "txt"].map(
-            (ext) => `${imageParams.paramFileName}.${ext}`
-          );
-
-          if (mode === "reproduce") {
-            const { percentDiff, pixelDiff } = await compareImage(imageFileName, genImageBuffer);
-            const isReproducible = percentDiff < REPROD_DIFF_TOLERANCE;
-            const chalkColor = isReproducible ? "green" : "yellow";
-            console.log(
-              `Pixel Diff: ${chalk[chalkColor](pixelDiff)}. Percent diff: ${
-                chalk[chalkColor](round(percentDiff * 100)) + "%"
-              }.`
-            );
-
-            const parentDir = path.join(
-              path.dirname(imageFileName),
-              isReproducible ? DIR_NAMES.reproducible : DIR_NAMES.nonReproducible
-            );
-            const productsDir = path.join(parentDir, DIR_NAMES.products);
-            await fs.mkdir(productsDir, { recursive: true });
-
-            await Promise.all([
-              fs.writeFile(path.join(productsDir, path.basename(imageFileName)), genImageBuffer),
-              fs.writeFile(path.join(productsDir, path.basename(paramFileName)), genParams),
-            ]);
-
-            await Promise.all(
-              [imageFileName, paramFileName].map((fileName) =>
-                fs.rename(fileName, path.join(parentDir, path.basename(fileName)))
-              )
-            );
-
-            console.log(
-              `${chalk.cyan(imageParams.paramFileName)} moved to ${chalk[
-                isReproducible ? "green" : "yellow"
-              ](parentDir)}.`
-            );
-          } else {
-            const outputDir = DIR_NAMES.upscaled;
-            const sourcesDir = DIR_NAMES.upscaleCompleted;
-
-            await Promise.all(
-              [outputDir, sourcesDir].map((dir) => fs.mkdir(dir, { recursive: true }))
-            );
-
-            await Promise.all([
-              fs.writeFile(path.join(outputDir, path.basename(imageFileName)), genImageBuffer),
-              fs.writeFile(path.join(outputDir, path.basename(paramFileName)), genParams),
-            ]);
-
-            await Promise.all(
-              [imageFileName, paramFileName].map((fileName) =>
-                fs.rename(fileName, path.join(sourcesDir, path.basename(fileName)))
-              )
-            );
-          }
-
-          GenQueue.endProgress();
           completedCount++;
           const isComplete = completedCount === totalCount;
 
@@ -948,7 +1002,7 @@ export const generateImages = async ({
             mainEmitter.emit("done");
           }
         } catch (err) {
-          GenQueue.endProgress();
+          GenQueue.stopProgress();
           console.error(chalk.red(err.stack));
         }
       })
@@ -960,7 +1014,7 @@ export const generateImages = async ({
 
 /* ---------------- Generate Lora Training Folder and Params ---------------- */
 export const generateLoraTrainingFolderAndParams = async () => {
-  const trainingParams = await loadLoraTrainingParams(DEFAULT_LORA_PARAMS_PATH);
+  const trainingParams = await loadLoraTrainingParams(DEFAULTS.LORA_PARAMS_PATH);
 
   const curDirName = path.basename(await fs.realpath("."));
   const loraName =
@@ -970,7 +1024,7 @@ export const generateLoraTrainingFolderAndParams = async () => {
   const modelList = await listModels(true);
   const modelIndex = +(await prompt(
     `${chalk.blueBright(
-      `Enter model to train on (1 - ${modelList.length}) ${chalk.grey(`(${DEFAULT_LORA_MODEL})`)}:`
+      `Enter model to train on (1 - ${modelList.length}) ${chalk.grey(`(${DEFAULTS.LORA_MODEL})`)}:`
     )}\n${makeConsoleList(
       modelList.map((m) => m.name),
       true
@@ -979,7 +1033,7 @@ export const generateLoraTrainingFolderAndParams = async () => {
   trainingParams.pretrained_model_name_or_path =
     modelIndex > 0 && modelIndex <= modelList.length
       ? modelList[modelIndex - 1].path
-      : DEFAULT_LORA_MODEL;
+      : DEFAULTS.LORA_MODEL;
 
   const { imageFileNames } = await listImageAndParamFileNames();
 
@@ -989,13 +1043,13 @@ export const generateLoraTrainingFolderAndParams = async () => {
     [imagesDirName, "logs", "output"].map((dirName) => fs.mkdir(dirName, { recursive: true }))
   );
 
-  trainingParams.logging_dir = path.resolve("logs");
-  trainingParams.output_dir = path.resolve("output");
-  trainingParams.train_data_dir = path.resolve("input");
+  trainingParams.logging_dir = path.resolve(LORA.LOGS_DIR);
+  trainingParams.output_dir = path.resolve(LORA.OUTPUT_DIR);
+  trainingParams.train_data_dir = path.resolve(LORA.INPUT_DIR);
 
   await Promise.all(
     imageFileNames.map((fileName) =>
-      fs.rename(`${fileName}.jpg`, path.join(imagesDirName, `${fileName}.jpg`))
+      fs.rename(`${fileName}.${EXTS.IMAGE}`, path.join(imagesDirName, `${fileName}.${EXTS.IMAGE}`))
     )
   );
   console.log(
@@ -1003,10 +1057,10 @@ export const generateLoraTrainingFolderAndParams = async () => {
   );
 
   const trainingParamsJson = JSON.stringify(trainingParams, null, 2);
-  await fs.writeFile(LORA_TRAINING_PARAMS_FILE_NAME, trainingParamsJson);
+  await fs.writeFile(LORA.TRAINING_PARAMS_FILE_NAME, trainingParamsJson);
 
   console.log(
-    chalk.green(`Created ${LORA_TRAINING_PARAMS_FILE_NAME}:`),
+    chalk.green(`Created ${LORA.TRAINING_PARAMS_FILE_NAME}:`),
     chalk.cyan(trainingParamsJson)
   );
   mainEmitter.emit("done");
@@ -1090,29 +1144,53 @@ export const initAutomatic1111Folders = async () => {
     const rootDir = await fs.realpath(".");
     console.log("Root Automatic1111 folder path: ", chalk.cyan(rootDir));
 
-    const promptForSymlink = async (targetDirName: string, sourceDir: string) => {
+    const config: Auto1111FolderConfig = await loadAuto1111FolderConfig();
+
+    const promptForSymlink = async (
+      folderName: Auto1111FolderName,
+      targetDirName: string,
+      sourceDir: string
+    ) => {
+      const existingPath = config[folderName];
       const folder = await promptForPath(
-        `Enter path of external ${chalk.magenta(targetDirName)} folder: `
+        `Enter path of external ${chalk.magenta(targetDirName)} folder${makeExistingValueLog(
+          existingPath
+        )}`
       );
-      if (!folder.length)
+
+      if (!folder.length && !existingPath)
         console.warn(chalk.yellow(`Not linking ${chalk.magenta(targetDirName)} folder.`));
       else {
         const hasSourceDir = await doesPathExist(sourceDir);
-        if (hasSourceDir) await fs.rename(sourceDir, `${sourceDir} (OLD)`);
+        if (hasSourceDir)
+          await fs.rename(
+            sourceDir,
+            path.join(path.dirname(sourceDir), `__OLD__${path.basename(sourceDir)}`)
+          );
 
         await fs.symlink(folder, path.join(rootDir, sourceDir), "junction");
-        console.log(chalk.green(`${targetDirName} folder linked.`));
+        config[folderName] = folder;
+        console.log(chalk.green(`${targetDirName} folder ${existingPath ? "re-" : ""}linked.`));
       }
     };
 
-    await promptForSymlink("Embeddings", "embeddings");
-    await promptForSymlink("Extensions", "extensions");
-    await promptForSymlink("Lora", "models\\Lora");
-    await promptForSymlink("LyCORIS / LoCon / LoHa", "models\\LyCORIS");
-    await promptForSymlink("Models", "models\\Stable-diffusion");
-    await promptForSymlink("Outputs", "outputs");
-    await promptForSymlink("VAE", "models\\VAE");
-    await promptForSymlink("ControlNet Poses", "models\\ControlNet");
+    await promptForSymlink("embeddings", "Embeddings", "embeddings");
+    await promptForSymlink("extensions", "Extensions", "extensions");
+    await promptForSymlink("lora", "Lora", "models\\Lora");
+    await promptForSymlink("lycoris", "LyCORIS / LoCon / LoHa", "models\\LyCORIS");
+    await promptForSymlink("models", "Models", "models\\Stable-diffusion");
+    await promptForSymlink("outputs", "Outputs", "outputs");
+    await promptForSymlink("vae", "VAE", "models\\VAE");
+    await promptForSymlink("controlNetPoses", "ControlNet Poses", "models\\ControlNet");
+
+    const configJson = JSON.stringify(config, null, 2);
+    await fs.writeFile(AUTO1111_FOLDER_CONFIG_FILE_NAME, configJson);
+
+    console.log(
+      chalk.green(`Created ${AUTO1111_FOLDER_CONFIG_FILE_NAME}:`),
+      chalk.cyan(configJson)
+    );
+    mainEmitter.emit("done");
   } catch (err) {
     console.error(chalk.red(err));
   } finally {
@@ -1166,10 +1244,10 @@ export const pruneImageParams = async ({
     paramFileNames.map(async (p) => {
       const image = imageFileNames.find((i) => i === p);
       if (!image) {
-        const fileName = `${p}.txt`;
+        const fileName = `${p}.${EXTS.PARAMS}`;
         await fs.rename(fileName, path.join(dirName, path.basename(fileName)));
         unusedParams.push(p);
-        console.log(chalk.yellow(`${fileName} pruned.`));
+        console.log(`${chalk.yellow(fileName)} pruned.`);
       }
     })
   );
@@ -1199,12 +1277,12 @@ export const segmentByDimensions = async ({ imageFileNames, noEmit }: ImageFileN
 
   await Promise.all(
     imageFileNames.map(async (name) => {
-      const { height, width } = await sharp(`${name}.jpg`).metadata();
+      const { height, width } = await sharp(`${name}.${EXTS.IMAGE}`).metadata();
       const dirName = `${height} x ${width}`;
 
       await fs.mkdir(dirName, { recursive: true });
       await Promise.all(
-        ["jpg", "txt"].map((ext) => {
+        [EXTS.IMAGE, EXTS.PARAMS].map((ext) => {
           const fileName = `${name}.${ext}`;
           return fs.rename(fileName, path.join(dirName, fileName));
         })
@@ -1226,9 +1304,11 @@ export const segmentByKeywords = async ({
   const promptForKeywords = async (type: "all" | "any") =>
     (
       await prompt(
-        `Enter keywords - ${type === "all" ? "all" : "at least one"} required ${chalk(
-          "(delineated by commas)"
-        )}: `
+        chalk.blueBright(
+          `Enter keywords - ${type === "all" ? "all" : "at least one"} required ${chalk(
+            "(delineated by commas)"
+          )}: `
+        )
       )
     )
       .replace(/^(,|\s)|(,|\s)$/g, "")
@@ -1246,33 +1326,28 @@ export const segmentByKeywords = async ({
 
   await Promise.all(
     allImageParams.map(async (imageParams) => {
-      const hasAllRequired =
-        requiredAllKeywords.length > 0
-          ? requiredAllKeywords.every((keyword) =>
-              new RegExp(escapeRegEx(keyword), "im").test(imageParams.rawParams)
-            )
-          : true;
-      const hasAnyRequired =
-        requiredAnyKeywords.length > 0
-          ? requiredAnyKeywords.some((keyword) =>
-              new RegExp(escapeRegEx(keyword), "im").test(imageParams.rawParams)
-            )
-          : true;
+      const testKeywords = (keywords: string[], type: "every" | "some") =>
+        keywords[type]((keyword) =>
+          new RegExp(escapeRegEx(keyword), "im").test(imageParams.rawParams)
+        ) ?? true;
+
+      const hasAllRequired = testKeywords(requiredAllKeywords, "every");
+      const hasAnyRequired = testKeywords(requiredAnyKeywords, "some");
 
       if (hasAllRequired && hasAnyRequired) {
         const dirName = `${requiredAllKeywords.join(" & ")} - ${requiredAnyKeywords.join(" ~ ")}`;
         await fs.mkdir(dirName, { recursive: true });
 
         await Promise.all(
-          ["jpg", "txt"].map((ext) => {
-            const filePath = `${imageParams.paramFileName}.${ext}`;
-            const fileName = `${path.basename(imageParams.paramFileName)}.${ext}`;
+          [EXTS.IMAGE, EXTS.PARAMS].map((ext) => {
+            const filePath = `${imageParams.fileName}.${ext}`;
+            const fileName = `${path.basename(imageParams.fileName)}.${ext}`;
             return fs.rename(filePath, path.join(dirName, fileName));
           })
         );
 
         segmentedCount++;
-        console.log(`Moved ${chalk.cyan(imageParams.paramFileName)} to ${chalk.magenta(dirName)}.`);
+        console.log(`Moved ${chalk.cyan(imageParams.fileName)} to ${chalk.magenta(dirName)}.`);
       }
     })
   );
@@ -1292,20 +1367,18 @@ export const segmentByModel = async ({
   const allImageParams = await parseAndSortImageParams({ imageFileNames, paramFileNames });
 
   await Promise.all(
-    allImageParams.map(async (imageParams) => {
-      await fs.mkdir(imageParams.model, { recursive: true });
+    allImageParams.map(async ({ fileName, model }) => {
+      const dirName = path.dirname(fileName);
+      await fs.mkdir(path.join(model, dirName), { recursive: true });
 
       await Promise.all(
-        ["jpg", "txt"].map((ext) => {
-          const fileName = `${imageParams.paramFileName}.${ext}`;
-          const newPath = path.join(imageParams.model, fileName);
-          return fs.rename(fileName, newPath);
+        [EXTS.IMAGE, EXTS.PARAMS].map((ext) => {
+          const name = `${fileName}.${ext}`;
+          return fs.rename(name, path.join(model, name));
         })
       );
 
-      console.log(
-        `Moved ${chalk.cyan(imageParams.paramFileName)} to ${chalk.magenta(imageParams.model)}.`
-      );
+      console.log(`Moved ${chalk.cyan(fileName)} to ${chalk.magenta(model)}.`);
     })
   );
 
@@ -1327,7 +1400,7 @@ export const segmentByUpscaled = async ({ paramFileNames, noEmit }: ParamFileNam
 
   await Promise.all(
     paramFileNames.map(async (i) => {
-      const imageParams = await fs.readFile(`${i}.txt`);
+      const imageParams = await fs.readFile(`${i}.${EXTS.PARAMS}`);
       const targetPath = imageParams.includes("Hires upscaler")
         ? DIR_NAMES.upscaled
         : DIR_NAMES.nonUpscaled;
@@ -1335,9 +1408,13 @@ export const segmentByUpscaled = async ({ paramFileNames, noEmit }: ParamFileNam
       isUpscaled ? upscaledCount++ : nonUpscaledCount++;
 
       await Promise.all(
-        ["jpg", "txt"].map((ext) => fs.rename(`${i}.${ext}`, `${targetPath}\\${i}.${ext}`))
+        [EXTS.IMAGE, EXTS.PARAMS].map((ext) =>
+          fs.rename(`${i}.${ext}`, `${targetPath}\\${i}.${ext}`)
+        )
       );
-      console.log(`Moved ${i} to ${(isUpscaled ? chalk.green : chalk.yellow)(targetPath)}.`);
+      console.log(
+        `Moved ${chalk.cyan(i)} to ${(isUpscaled ? chalk.green : chalk.yellow)(targetPath)}.`
+      );
     })
   );
 

@@ -2,6 +2,52 @@ export type ImageFileNames = { imageFileNames: string[] };
 export type ParamFileNames = { paramFileNames: string[] };
 export type FileNames = ImageFileNames & ParamFileNames;
 
+export type Auto1111FolderConfig = {
+  controlNetPoses?: string;
+  embeddings?: string;
+  extensions?: string;
+  lora?: string;
+  lycoris?: string;
+  models?: string;
+  outputs?: string;
+  vae?: string;
+};
+export type Auto1111FolderName = keyof Auto1111FolderConfig;
+
+export type ImageParams = {
+  cfgScale?: number;
+  clipSkip?: number;
+  cutoffDisableForNeg?: boolean;
+  cutoffEnabled?: boolean;
+  cutoffInterpolation?: string;
+  cutoffPadding?: string;
+  cutoffStrong?: boolean;
+  cutoffTargets?: string[];
+  cutoffWeight?: number;
+  fileName?: string;
+  height?: number;
+  hiresDenoisingStrength?: number;
+  hiresScale?: number;
+  hiresSteps?: number;
+  hiresUpscaler?: string;
+  model?: string;
+  negPrompt?: string;
+  negTemplate?: string;
+  prompt?: string;
+  rawParams?: string;
+  restoreFaces?: boolean;
+  sampler?: string;
+  seed?: number;
+  steps?: number;
+  subseed?: number;
+  subseedStrength?: number;
+  template?: string;
+  vae?: string;
+  vaeHash?: string;
+  width?: number;
+};
+export type Txt2ImgOverrides = Omit<ImageParams, "fileName" | "rawParams" | "vaeHash">;
+
 export type LoraTrainingParams = {
   cache_latents?: boolean;
   caption_extension?: string;
@@ -56,32 +102,43 @@ export type LoraTrainingParams = {
   xformers?: boolean;
 };
 
-export type Model = { hash: string; name: string };
+export type Model = { hash: string; name: string; path: string };
 
 export type NoEmit = { noEmit?: boolean };
 
-export type Txt2ImgOverrides = {
-  cfgScale?: number;
-  clipSkip?: number;
-  cutoffDisableForNeg?: boolean;
-  cutoffEnabled?: true;
-  cutoffInterpolation?: string;
-  cutoffPadding?: string;
-  cutoffStrong?: boolean;
-  cutoffTargets?: string[];
-  cutoffWeight?: number;
-  denoisingStrength?: number;
-  hiresScale?: number;
-  hiresSteps?: number;
-  model?: string;
-  negTemplate?: string;
-  restoreFaces?: boolean;
-  sampler?: string;
-  seed?: number;
-  steps?: number;
+export type Txt2ImgMode = "reproduce" | "upscale";
+
+export type Txt2ImgOverrideGroup = {
+  dirPath: string;
+  fileNames: string[];
+  overrides?: Txt2ImgOverrides;
+};
+
+export type Txt2ImgRequest = {
+  alwayson_scripts?: object;
+  cfg_scale: number;
+  denoising_strength?: number;
+  enable_hr: boolean;
+  height: number;
+  hr_scale?: number;
+  hr_steps?: number;
+  hr_upscaler?: string;
+  negative_prompt: string;
+  override_settings?: object;
+  override_settings_restore_afterwards?: boolean;
+  prompt: string;
+  restore_faces?: boolean;
+  sampler_name: string;
+  save_images: boolean;
+  seed: number;
+  send_images: boolean;
+  steps: number;
   subseed?: number;
-  subseedStrength?: number;
-  upscaler?: string;
-  template?: string;
-  vae?: string;
+  subseed_strength?: number;
+  width: number;
+};
+
+export type VAE = {
+  fileName: string;
+  hash: string;
 };
