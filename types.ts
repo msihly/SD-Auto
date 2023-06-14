@@ -47,6 +47,7 @@ export type ImageParams = {
   width?: number;
 };
 export type Txt2ImgOverrides = Omit<ImageParams, "fileName" | "rawParams" | "vaeHash">;
+export type Txt2ImgOverride = keyof Txt2ImgOverrides;
 
 export type LoraTrainingParams = {
   cache_latents?: boolean;

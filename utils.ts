@@ -164,7 +164,7 @@ export const makeConsoleList = (items: string[], numerical = false) =>
     .map((o, i) => `  ${chalk.blueBright(numerical ? `${i + 1}.` : "•")} ${chalk.white(o)}`)
     .join("\n") + "\n";
 
-export const makeExistingValueLog = (val: string) =>
+export const makeExistingValueLog = (val: string | string[] | number | boolean) =>
   `${val ? ` ${chalk.grey(`(${val})`)}` : ""}${chalk.blueBright(": ")}`;
 
 export const prompt = (query: string, callback?: (answer: string) => void): Promise<string> =>

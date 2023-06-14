@@ -32,6 +32,7 @@ import {
   NoEmit,
   ParamFileNames,
   Txt2ImgMode,
+  Txt2ImgOverride,
   Txt2ImgOverrideGroup,
   Txt2ImgOverrides,
   Txt2ImgRequest,
@@ -683,7 +684,7 @@ export const generateBatches = async ({
           try {
             const fileName = `${name}.${EXTS.IMAGE}`;
             await fs.copyFile(fileName, path.join(batch.folderName, path.basename(fileName)));
-            console.log(`Moved ${chalk.cyan(name)} to ${chalk.magenta(batch.folderName)}.`);
+            console.log(`Copied ${chalk.cyan(name)} to ${chalk.magenta(batch.folderName)}.`);
           } catch (err) {
             console.error(chalk.red(err));
           }
@@ -1018,10 +1019,11 @@ export const generateLoraTrainingFolderAndParams = async () => {
 
   const curDirName = path.basename(await fs.realpath("."));
   const loraName =
-    (await prompt(`Enter Lora name ${chalk.grey(`(${curDirName})`)}: `)) || curDirName;
+    (await prompt(chalk.blueBright(`Enter Lora name ${chalk.grey(`(${curDirName})`)}: `))) ||
+    curDirName;
   trainingParams.output_name = loraName;
 
-  const modelList = await listModels(true);
+  const modelList = await listModels();
   const modelIndex = +(await prompt(
     `${chalk.blueBright(
       `Enter model to train on (1 - ${modelList.length}) ${chalk.grey(`(${DEFAULTS.LORA_MODEL})`)}:`
@@ -1068,9 +1070,9 @@ export const generateLoraTrainingFolderAndParams = async () => {
 
 /* ---------------------- Generate Txt2Img Overrides ---------------------- */
 export const generateTxt2ImgOverrides = async () => {
-  const overrides: Txt2ImgOverrides = await loadTxt2ImgOverrides();
+  const overrides: Partial<Record<Txt2ImgOverride, any>> = await loadTxt2ImgOverrides();
 
-  const booleanPrompt = async (question: string, optName: string) => {
+  const booleanPrompt = async (question: string, optName: Txt2ImgOverride) => {
     const res = (await prompt(
       chalk.blueBright(`${question} (y/n)${makeExistingValueLog(overrides[optName])}`)
     )) as "y" | "n";
@@ -1078,7 +1080,7 @@ export const generateTxt2ImgOverrides = async () => {
     if (res === "y" || res === "n") overrides[optName] = res === "y";
   };
 
-  const numericalPrompt = async (question: string, optName: string) => {
+  const numericalPrompt = async (question: string, optName: Txt2ImgOverride) => {
     const res = await prompt(
       `${chalk.blueBright(question)}${makeExistingValueLog(overrides[optName])}`
     );
@@ -1088,7 +1090,7 @@ export const generateTxt2ImgOverrides = async () => {
 
   const numListPrompt = async (
     label: string,
-    optName: string,
+    optName: Txt2ImgOverride,
     options: { label: string; value: string }[]
   ) => {
     const index = +(await prompt(
@@ -1105,7 +1107,7 @@ export const generateTxt2ImgOverrides = async () => {
 
   await numericalPrompt("Enter CFG Scale", "cfgScale");
   await numericalPrompt("Enter Clip Skip", "clipSkip");
-  await numericalPrompt("Enter Denoising Strength", "denoisingStrength");
+  await numericalPrompt("Enter Denoising Strength", "hiresDenoisingStrength");
   await numericalPrompt("Enter Hires Scale", "hiresScale");
   await numericalPrompt("Enter Hires Steps", "hiresSteps");
   const models = (await listModels()).map((m) => m.name);
@@ -1118,7 +1120,7 @@ export const generateTxt2ImgOverrides = async () => {
   await numericalPrompt("Enter Subseed", "subseed");
   await numericalPrompt("Enter Subseed Strength", "subseedStrength");
   const upscalers = await listUpscalers();
-  await numListPrompt("Upscaler", "upscaler", valsToOpts(upscalers));
+  await numListPrompt("Upscaler", "hiresUpscaler", valsToOpts(upscalers));
   const vaes = await listVAEs();
   await numListPrompt(
     "VAE",
@@ -1399,21 +1401,24 @@ export const segmentByUpscaled = async ({ paramFileNames, noEmit }: ParamFileNam
   let nonUpscaledCount = 0;
 
   await Promise.all(
-    paramFileNames.map(async (i) => {
-      const imageParams = await fs.readFile(`${i}.${EXTS.PARAMS}`);
+    paramFileNames.map(async (fileName) => {
+      const imageParams = await fs.readFile(`${fileName}.${EXTS.PARAMS}`);
       const targetPath = imageParams.includes("Hires upscaler")
         ? DIR_NAMES.upscaled
         : DIR_NAMES.nonUpscaled;
       const isUpscaled = targetPath === DIR_NAMES.upscaled;
       isUpscaled ? upscaledCount++ : nonUpscaledCount++;
 
+      const filePath = path.join(targetPath, fileName);
+      await fs.mkdir(path.dirname(filePath), { recursive: true });
+
       await Promise.all(
         [EXTS.IMAGE, EXTS.PARAMS].map((ext) =>
-          fs.rename(`${i}.${ext}`, `${targetPath}\\${i}.${ext}`)
+          fs.rename(`${fileName}.${ext}`, `${filePath}.${ext}`)
         )
       );
       console.log(
-        `Moved ${chalk.cyan(i)} to ${(isUpscaled ? chalk.green : chalk.yellow)(targetPath)}.`
+        `Moved ${chalk.cyan(fileName)} to ${(isUpscaled ? chalk.green : chalk.yellow)(targetPath)}.`
       );
     })
   );
