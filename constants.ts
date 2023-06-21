@@ -16,6 +16,7 @@ export const DEFAULTS = {
 };
 
 export const DIR_NAMES = {
+  empty: "Empty Folders",
   nonJPG: "Non-JPG",
   nonReproducible: "Non-Reproducible",
   nonUpscaled: "Non-Upscaled",

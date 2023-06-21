@@ -159,6 +159,36 @@ export const getImagesInFolders = async ({
   return imagesInFolders;
 };
 
+export const listFolders = async (dirPath: string = "."): Promise<string[]> => {
+  const paths = await fs.readdir(dirPath, { withFileTypes: true });
+  if (paths.length === 0) return [];
+  console.log("Paths", paths);
+
+  return (
+    await Promise.all(
+      paths.map(async (dirent) => {
+        if (dirent.isDirectory()) {
+          const subDirPath = path.join(dirPath, dirent.name);
+          const subPaths = await fs.readdir(subDirPath, { withFileTypes: true });
+          const subDirs = subPaths.filter((d) => d.isDirectory());
+          return subDirs.length ? await listFolders(subDirPath) : subDirPath;
+        }
+      })
+    )
+  )
+    .flat()
+    .filter((d) => d);
+};
+
+export const listEmptyFolders = async (dirPath: string = ".") => {
+  const folders = await listFolders(dirPath);
+  return (
+    await Promise.all(
+      folders.map(async (folder) => ((await fs.readdir(folder)).length === 0 ? folder : undefined))
+    )
+  ).filter((f) => f);
+};
+
 export const makeConsoleList = (items: string[], numerical = false) =>
   items
     .map((o, i) => `  ${chalk.blueBright(numerical ? `${i + 1}.` : "•")} ${chalk.white(o)}`)
@@ -182,6 +212,19 @@ export const randomSort = <T>(arr: T[]): T[] => {
     [newArr[i], newArr[rand]] = [newArr[rand], newArr[i]];
   }
   return newArr;
+};
+
+export const removeEmptyFolders = async (dirPath: string = ".", excluded?: string[]) => {
+  if (!(await fs.stat(dirPath)).isDirectory() || excluded?.includes(path.basename(dirPath))) return;
+
+  let files = await fs.readdir(dirPath);
+  if (files.length) {
+    await Promise.all(files.map((f) => removeEmptyFolders(path.join(dirPath, f), excluded)));
+    files = await fs.readdir(dirPath);
+  }
+
+  if (!files.length && path.resolve(dirPath) !== path.resolve(process.cwd()))
+    await fs.rmdir(dirPath);
 };
 
 export const round = (num: number, decimals = 2) => {

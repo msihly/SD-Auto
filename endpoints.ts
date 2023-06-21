@@ -55,6 +55,7 @@ import {
   makeExistingValueLog,
   prompt,
   randomSort,
+  removeEmptyFolders,
   round,
   sha256File,
   valsToOpts,
@@ -94,9 +95,7 @@ const apiCall = async (
       : err.stack;
 
     if (withThrow) throw new Error(errMsg);
-    else console.error(chalk.red(errMsg));
-
-    mainEmitter.emit("done");
+    console.error(chalk.red(`[API Error::${method}] ${endpoint} - ${config}\n${errMsg}`));
     return { success: false, error: errMsg };
   }
 };
@@ -407,126 +406,143 @@ const parseImageParams = async ({
   overrides?: Txt2ImgOverrides;
   paramFileName: string;
 }) => {
-  const fileName = path.join(
-    path.dirname(paramFileName),
-    path.basename(paramFileName, path.extname(paramFileName))
-  );
-
-  const imageParams = await fs.readFile(`${fileName}.${EXTS.PARAMS}`, { encoding: "utf8" });
-
-  const negPromptEndIndex = imageParams.indexOf("Steps: ");
-  let negPromptStartIndex = imageParams.indexOf("Negative prompt: ");
-  if (negPromptStartIndex < 0) negPromptStartIndex = negPromptEndIndex;
-
-  const prompt = imageParams.substring(0, negPromptStartIndex).replace(/(\n|\r)$/gim, "");
-  const negPrompt = imageParams
-    .substring(negPromptStartIndex, negPromptEndIndex)
-    .replace(/(\n|\r)|Negative prompt:\s/gim, "");
-  const restParams = imageParams.substring(negPromptEndIndex);
-
-  const rawModelName = overrides?.model ?? parseImageParam(restParams, "Model", false);
-  const modelHash = parseImageParam(restParams, "Model hash", false);
-
-  let model = remapModelName(models, modelHash);
-  if (!model) {
-    model = rawModelName;
-    console.log(
-      chalk.yellow(
-        `Invalid model name ${chalk.yellow(rawModelName)} found for ${chalk.cyan(paramFileName)}.`
-      )
+  try {
+    const fileName = path.join(
+      path.dirname(paramFileName),
+      path.basename(paramFileName, path.extname(paramFileName))
     );
-  }
 
-  /* ------------------------------ Main Settings ----------------------------- */
-  const cfgScale = overrides?.cfgScale ?? parseImageParam(restParams, "CFG scale", true);
-  const clipSkip = overrides?.clipSkip ?? parseImageParam(restParams, "Clip skip", true, true);
-  const hasRestoreFaces = overrides?.restoreFaces ?? !!restParams.includes("Face restoration");
-  const hiresDenoisingStrength =
-    overrides?.hiresDenoisingStrength ?? DEFAULTS.HIRES_DENOISING_STRENGTH;
-  const hiresScale = overrides?.hiresScale ?? DEFAULTS.HIRES_SCALE;
-  const hiresSteps =
-    overrides?.hiresSteps ?? parseImageParam(restParams, "Hires steps", true, true);
-  const hiresUpscaler = overrides?.hiresUpscaler ?? DEFAULTS.HIRES_UPSCALER;
-  const sampler = overrides?.sampler ?? parseImageParam(restParams, "Sampler", false);
-  const seed = overrides?.seed ?? parseImageParam(restParams, "Seed", true);
-  const steps = overrides?.steps ?? parseImageParam(restParams, "Steps", true);
-  const subseed = overrides?.subseed ?? parseImageParam(restParams, "Variation seed", true, true);
-  const subseedStrength =
-    overrides?.subseedStrength ??
-    parseImageParam(restParams, "Variation seed strength", true, true);
-  const vaeHash =
-    overrides?.vae ?? parseImageParam(restParams, '"vae"', false, true, '"', ': "') ?? "None";
-  const [width, height] = parseImageParam(restParams, "Size", false)
-    .split("x")
-    .map((d) => +d);
+    const imageParams = await fs.readFile(`${fileName}.${EXTS.PARAMS}`, { encoding: "utf8" });
 
-  /* --------------------------- "Cutoff" Extension --------------------------- */
-  const cutoffEnabled =
-    overrides?.cutoffEnabled ??
-    parseImageParam(restParams, "Cutoff enabled", false, true) === "True";
-  const cutoffTargets = cutoffEnabled
-    ? overrides?.cutoffTargets ??
-      (JSON.parse(
+    const negPromptEndIndex = imageParams.indexOf("Steps: ");
+    let negPromptStartIndex = imageParams.indexOf("Negative prompt: ");
+    if (negPromptStartIndex < 0) negPromptStartIndex = negPromptEndIndex;
+
+    const prompt = imageParams.substring(0, negPromptStartIndex).replace(/(\n|\r)$/gim, "");
+    const negPrompt = imageParams
+      .substring(negPromptStartIndex, negPromptEndIndex)
+      .replace(/(\n|\r)|Negative prompt:\s/gim, "");
+    const restParams = imageParams.substring(negPromptEndIndex);
+
+    const rawModelName = overrides?.model ?? parseImageParam(restParams, "Model", false);
+    const modelHash = parseImageParam(restParams, "Model hash", false);
+
+    let model = remapModelName(models, modelHash);
+    if (!model) {
+      model = rawModelName;
+      console.log(
+        chalk.yellow(
+          `Invalid model name ${chalk.yellow(rawModelName)} found for ${chalk.cyan(paramFileName)}.`
+        )
+      );
+    }
+
+    /* ------------------------------ Main Settings ----------------------------- */
+    const cfgScale = overrides?.cfgScale ?? parseImageParam(restParams, "CFG scale", true);
+    const clipSkip = overrides?.clipSkip ?? parseImageParam(restParams, "Clip skip", true, true);
+    const hasRestoreFaces = overrides?.restoreFaces ?? !!restParams.includes("Face restoration");
+    const hiresDenoisingStrength =
+      overrides?.hiresDenoisingStrength ?? DEFAULTS.HIRES_DENOISING_STRENGTH;
+    const hiresScale = overrides?.hiresScale ?? DEFAULTS.HIRES_SCALE;
+    const hiresSteps =
+      overrides?.hiresSteps ?? parseImageParam(restParams, "Hires steps", true, true);
+    const hiresUpscaler = overrides?.hiresUpscaler ?? DEFAULTS.HIRES_UPSCALER;
+    const sampler = overrides?.sampler ?? parseImageParam(restParams, "Sampler", false);
+    const seed = overrides?.seed ?? parseImageParam(restParams, "Seed", true);
+    const steps = overrides?.steps ?? parseImageParam(restParams, "Steps", true);
+    const subseed = overrides?.subseed ?? parseImageParam(restParams, "Variation seed", true, true);
+    const subseedStrength =
+      overrides?.subseedStrength ??
+      parseImageParam(restParams, "Variation seed strength", true, true);
+    const vaeHash =
+      overrides?.vae ?? parseImageParam(restParams, '"vae"', false, true, '"', ': "') ?? "None";
+    const [width, height] = parseImageParam(restParams, "Size", false)
+      .split("x")
+      .map((d) => +d);
+
+    /* --------------------------- "Cutoff" Extension --------------------------- */
+    const parseCutOffTargets = () => {
+      const targets =
         parseImageParam(
           restParams.replace(/\"/gm, ""),
           "Cutoff targets",
           false,
           true,
           "],"
-        ).replace(/\'/gm, '"') + "]"
-      ) as string[])
-    : undefined;
-  const cutoffPadding =
-    overrides?.cutoffPadding ?? parseImageParam(restParams, "Cutoff padding", false, true);
-  const cutoffWeight =
-    overrides?.cutoffWeight ?? parseImageParam(restParams, "Cutoff weight", true, true);
-  const cutoffDisableForNeg =
-    overrides?.cutoffDisableForNeg ??
-    parseImageParam(restParams, "Cutoff disable_for_neg", false, true) === "True";
-  const cutoffStrong =
-    overrides?.cutoffStrong ?? parseImageParam(restParams, "Cutoff strong", false, true) === "True";
-  const cutoffInterpolation =
-    overrides?.cutoffInterpolation ??
-    parseImageParam(restParams, "Cutoff interpolation", false, true);
+        ).replace(/\'/gm, '"') + "]";
 
-  /* ----------------------- "Dynamic Prompts" Extension ---------------------- */
-  const template =
-    overrides?.template ??
-    parseImageParam(restParams, "Template", false, true, "Negative Template");
-  const negTemplate =
-    overrides?.negTemplate ?? parseImageParam(restParams, "Negative Template", false, true, "\r");
+      try {
+        return JSON.parse(targets) as string[];
+      } catch (err) {
+        return targets
+          .replace(/\[|\]/gim, "")
+          .split(",")
+          .map((d) => d.trim());
+      }
+    };
 
-  return {
-    cfgScale,
-    clipSkip,
-    cutoffEnabled,
-    cutoffTargets,
-    cutoffPadding,
-    cutoffWeight,
-    cutoffDisableForNeg,
-    cutoffStrong,
-    cutoffInterpolation,
-    fileName,
-    hasRestoreFaces,
-    height,
-    hiresDenoisingStrength,
-    hiresScale,
-    hiresSteps,
-    hiresUpscaler,
-    model,
-    negPrompt,
-    negTemplate,
-    prompt,
-    rawParams: imageParams,
-    sampler,
-    seed,
-    steps,
-    subseed,
-    subseedStrength,
-    template,
-    width,
-    vaeHash,
-  };
+    const cutoffEnabled =
+      overrides?.cutoffEnabled ??
+      parseImageParam(restParams, "Cutoff enabled", false, true) === "True";
+    const cutoffTargets = cutoffEnabled
+      ? overrides?.cutoffTargets ?? parseCutOffTargets()
+      : undefined;
+    const cutoffPadding =
+      overrides?.cutoffPadding ?? parseImageParam(restParams, "Cutoff padding", false, true);
+    const cutoffWeight =
+      overrides?.cutoffWeight ?? parseImageParam(restParams, "Cutoff weight", true, true);
+    const cutoffDisableForNeg =
+      overrides?.cutoffDisableForNeg ??
+      parseImageParam(restParams, "Cutoff disable_for_neg", false, true) === "True";
+    const cutoffStrong =
+      overrides?.cutoffStrong ??
+      parseImageParam(restParams, "Cutoff strong", false, true) === "True";
+    const cutoffInterpolation =
+      overrides?.cutoffInterpolation ??
+      parseImageParam(restParams, "Cutoff interpolation", false, true);
+
+    /* ----------------------- "Dynamic Prompts" Extension ---------------------- */
+    const template =
+      overrides?.template ??
+      parseImageParam(restParams, "Template", false, true, "Negative Template");
+    const negTemplate =
+      overrides?.negTemplate ?? parseImageParam(restParams, "Negative Template", false, true, "\r");
+
+    return {
+      cfgScale,
+      clipSkip,
+      cutoffEnabled,
+      cutoffTargets,
+      cutoffPadding,
+      cutoffWeight,
+      cutoffDisableForNeg,
+      cutoffStrong,
+      cutoffInterpolation,
+      fileName,
+      hasRestoreFaces,
+      height,
+      hiresDenoisingStrength,
+      hiresScale,
+      hiresSteps,
+      hiresUpscaler,
+      model,
+      negPrompt,
+      negTemplate,
+      prompt,
+      rawParams: imageParams,
+      sampler,
+      seed,
+      steps,
+      subseed,
+      subseedStrength,
+      template,
+      width,
+      vaeHash,
+    };
+  } catch (err) {
+    console.log(chalk.red(`Error parsing ${chalk.cyan(paramFileName)}: ${err.message}`));
+    return undefined;
+  }
 };
 
 /* -------------- Parse and Sort Image Parameter Files by Model ------------- */
@@ -556,12 +572,14 @@ const parseAndSortImageParams = async (fileNames: FileNames): Promise<ImageParam
         )
       )
     )
-  ).sort((a, b) => {
-    if (a.vaeHash && !b.vaeHash) return -1;
-    if (!a.vaeHash && b.vaeHash) return 1;
-    if (a.vaeHash && b.vaeHash) return a.vaeHash.localeCompare(b.vaeHash);
-    return a.model.localeCompare(b.model);
-  });
+  )
+    .filter((p) => !!p)
+    .sort((a, b) => {
+      if (a.vaeHash && !b.vaeHash) return -1;
+      if (!a.vaeHash && b.vaeHash) return 1;
+      if (a.vaeHash && b.vaeHash) return a.vaeHash.localeCompare(b.vaeHash);
+      return a.model.localeCompare(b.model);
+    });
 
   console.log(chalk.green("Generation parameters parsed and sorted."));
   return allImageParams;
@@ -818,68 +836,79 @@ class GenerationQueue extends PromiseQueue {
   }
 
   async reproduce(txt2ImgRequest: Txt2ImgRequest, imageParams: ImageParams) {
-    GenQueue.startProgress();
+    try {
+      this.startProgress();
 
-    const { imageFileName, paramFileName } = extendFileName(imageParams.fileName);
-    const res = await this.txt2Img(txt2ImgRequest, imageParams);
+      const { imageFileName, paramFileName } = extendFileName(imageParams.fileName);
 
-    const { percentDiff, pixelDiff } = await compareImage(imageFileName, res.imageBuffer);
-    const isReproducible = percentDiff < REPROD_DIFF_TOLERANCE;
-    const chalkColor = isReproducible ? "green" : "yellow";
-    console.log(
-      `\nPixel Diff: ${chalk[chalkColor](pixelDiff)}. Percent diff: ${
-        chalk[chalkColor](round(percentDiff * 100)) + "%"
-      }.`
-    );
+      const res = await this.txt2Img(txt2ImgRequest, imageParams);
 
-    const parentDir = path.join(
-      path.dirname(imageFileName),
-      isReproducible ? DIR_NAMES.reproducible : DIR_NAMES.nonReproducible
-    );
-    const productsDir = path.join(parentDir, DIR_NAMES.products);
-    await fs.mkdir(productsDir, { recursive: true });
+      const { percentDiff, pixelDiff } = await compareImage(imageFileName, res.imageBuffer);
+      const isReproducible = percentDiff < REPROD_DIFF_TOLERANCE;
+      const chalkColor = isReproducible ? "green" : "yellow";
+      console.log(
+        `\nPixel Diff: ${chalk[chalkColor](pixelDiff)}. Percent diff: ${
+          chalk[chalkColor](round(percentDiff * 100)) + "%"
+        }.`
+      );
 
-    await Promise.all([
-      fs.writeFile(path.join(productsDir, path.basename(imageFileName)), res.imageBuffer),
-      fs.writeFile(path.join(productsDir, path.basename(paramFileName)), res.params),
-    ]);
+      const parentDir = path.join(
+        path.dirname(imageFileName),
+        isReproducible ? DIR_NAMES.reproducible : DIR_NAMES.nonReproducible
+      );
+      const productsDir = path.join(parentDir, DIR_NAMES.products);
+      await fs.mkdir(productsDir, { recursive: true });
 
-    await Promise.all(
-      [imageFileName, paramFileName].map((fileName) =>
-        fs.rename(fileName, path.join(parentDir, path.basename(fileName)))
-      )
-    );
+      await Promise.all([
+        fs.writeFile(path.join(productsDir, path.basename(imageFileName)), res.imageBuffer),
+        fs.writeFile(path.join(productsDir, path.basename(paramFileName)), res.params),
+      ]);
 
-    GenQueue.stopProgress();
+      await Promise.all(
+        [imageFileName, paramFileName].map((fileName) =>
+          fs.rename(fileName, path.join(parentDir, path.basename(fileName)))
+        )
+      );
 
-    console.log(
-      `\n${chalk.cyan(imageParams.fileName)} moved to ${chalk[isReproducible ? "green" : "yellow"](
-        parentDir
-      )}.`
-    );
+      this.stopProgress();
+
+      console.log(
+        `\n${chalk.cyan(imageParams.fileName)} moved to ${chalk[
+          isReproducible ? "green" : "yellow"
+        ](parentDir)}.`
+      );
+    } catch (err) {
+      this.stopProgress();
+      console.error(chalk.red(err.stack));
+    }
   }
 
   async upscale(txt2ImgRequest: Txt2ImgRequest, imageParams: ImageParams) {
-    GenQueue.startProgress();
+    try {
+      this.startProgress();
 
-    const outputDir = DIR_NAMES.upscaled;
-    const sourcesDir = DIR_NAMES.upscaleCompleted;
-    await Promise.all([outputDir, sourcesDir].map((dir) => fs.mkdir(dir, { recursive: true })));
+      const outputDir = DIR_NAMES.upscaled;
+      const sourcesDir = DIR_NAMES.upscaleCompleted;
+      await Promise.all([outputDir, sourcesDir].map((dir) => fs.mkdir(dir, { recursive: true })));
 
-    const { imageFileName, paramFileName } = extendFileName(imageParams.fileName);
-    const res = await this.txt2Img(txt2ImgRequest, imageParams);
-    await Promise.all([
-      fs.writeFile(path.join(outputDir, path.basename(imageFileName)), res.imageBuffer),
-      fs.writeFile(path.join(outputDir, path.basename(paramFileName)), res.params),
-    ]);
+      const { imageFileName, paramFileName } = extendFileName(imageParams.fileName);
+      const res = await this.txt2Img(txt2ImgRequest, imageParams);
+      await Promise.all([
+        fs.writeFile(path.join(outputDir, path.basename(imageFileName)), res.imageBuffer),
+        fs.writeFile(path.join(outputDir, path.basename(paramFileName)), res.params),
+      ]);
 
-    await Promise.all(
-      [imageFileName, paramFileName].map((fileName) =>
-        fs.rename(fileName, path.join(sourcesDir, path.basename(fileName)))
-      )
-    );
+      await Promise.all(
+        [imageFileName, paramFileName].map((fileName) =>
+          fs.rename(fileName, path.join(sourcesDir, path.basename(fileName)))
+        )
+      );
 
-    GenQueue.stopProgress();
+      this.stopProgress();
+    } catch (err) {
+      this.stopProgress();
+      console.error(chalk.red(err.stack));
+    }
   }
 
   async switchModelIfNeeded(modelName: string, models: Model[], fileName: string) {
@@ -1170,8 +1199,10 @@ export const initAutomatic1111Folders = async () => {
             path.join(path.dirname(sourceDir), `__OLD__${path.basename(sourceDir)}`)
           );
 
-        await fs.symlink(folder, path.join(rootDir, sourceDir), "junction");
-        config[folderName] = folder;
+        const targetPath = folder || existingPath;
+        await fs.symlink(targetPath, path.join(rootDir, sourceDir), "junction");
+        config[folderName] = targetPath;
+
         console.log(chalk.green(`${targetDirName} folder ${existingPath ? "re-" : ""}linked.`));
       }
     };
@@ -1279,20 +1310,26 @@ export const segmentByDimensions = async ({ imageFileNames, noEmit }: ImageFileN
 
   await Promise.all(
     imageFileNames.map(async (name) => {
-      const { height, width } = await sharp(`${name}.${EXTS.IMAGE}`).metadata();
-      const dirName = `${height} x ${width}`;
+      try {
+        const { height, width } = await sharp(`${name}.${EXTS.IMAGE}`).metadata();
+        const dirName = path.join(`${height} x ${width}`, path.dirname(name));
+        await fs.mkdir(dirName, { recursive: true });
 
-      await fs.mkdir(dirName, { recursive: true });
-      await Promise.all(
-        [EXTS.IMAGE, EXTS.PARAMS].map((ext) => {
-          const fileName = `${name}.${ext}`;
-          return fs.rename(fileName, path.join(dirName, fileName));
-        })
-      );
+        await Promise.all(
+          [EXTS.IMAGE, EXTS.PARAMS].map((ext) => {
+            const fileName = `${name}.${ext}`;
+            return fs.rename(fileName, path.join(dirName, path.basename(fileName)));
+          })
+        );
 
-      console.log(`Moved ${chalk.cyan(name)} to ${chalk.magenta(dirName)}.`);
+        console.log(`Moved ${chalk.cyan(name)} to ${chalk.magenta(dirName)}.`);
+      } catch (err) {
+        console.error(chalk.red("Error segmenting file by dimensions: ", err.stack));
+      }
     })
   );
+
+  await removeEmptyFolders();
 
   if (!noEmit) mainEmitter.emit("done");
 };
@@ -1328,16 +1365,23 @@ export const segmentByKeywords = async ({
 
   await Promise.all(
     allImageParams.map(async (imageParams) => {
+      try {
       const testKeywords = (keywords: string[], type: "every" | "some") =>
-        keywords[type]((keyword) =>
-          new RegExp(escapeRegEx(keyword), "im").test(imageParams.rawParams)
-        ) ?? true;
+        keywords.length > 0
+          ? keywords[type]((keyword) =>
+              new RegExp(escapeRegEx(keyword), "im").test(imageParams.rawParams)
+            )
+          : true;
 
       const hasAllRequired = testKeywords(requiredAllKeywords, "every");
       const hasAnyRequired = testKeywords(requiredAnyKeywords, "some");
 
       if (hasAllRequired && hasAnyRequired) {
-        const dirName = `${requiredAllKeywords.join(" & ")} - ${requiredAnyKeywords.join(" ~ ")}`;
+          const reqAll =
+            requiredAllKeywords.length > 0 ? `[${requiredAllKeywords.join(" & ")}]` : "";
+          const reqAny =
+            requiredAnyKeywords.length > 0 ? `(${requiredAnyKeywords.join(" ~ ")})` : "";
+        const dirName = `${reqAll}${reqAll && reqAny ? " - " : ""}${reqAny}`;
         await fs.mkdir(dirName, { recursive: true });
 
         await Promise.all(
@@ -1350,9 +1394,14 @@ export const segmentByKeywords = async ({
 
         segmentedCount++;
         console.log(`Moved ${chalk.cyan(imageParams.fileName)} to ${chalk.magenta(dirName)}.`);
+        }
+      } catch (err) {
+        console.error(chalk.red("Error segmenting file by keywords: ", err.stack));
       }
     })
   );
+
+  await removeEmptyFolders();
 
   console.log(chalk.cyan(segmentedCount), chalk.green(" files segmented by keyword."));
   if (!noEmit) mainEmitter.emit("done");
@@ -1383,6 +1432,8 @@ export const segmentByModel = async ({
       console.log(`Moved ${chalk.cyan(fileName)} to ${chalk.magenta(model)}.`);
     })
   );
+
+  await removeEmptyFolders();
 
   console.log(chalk.green("Files segmented by model."));
   if (!noEmit) mainEmitter.emit("done");
@@ -1422,6 +1473,8 @@ export const segmentByUpscaled = async ({ paramFileNames, noEmit }: ParamFileNam
       );
     })
   );
+
+  await removeEmptyFolders();
 
   console.log(
     `${chalk.green("Files segmented by upscaled.")} ${chalk.cyan(
