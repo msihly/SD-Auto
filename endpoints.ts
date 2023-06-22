@@ -60,6 +60,7 @@ import {
   sha256File,
   valsToOpts,
 } from "./utils";
+import env from "./env";
 
 /* -------------------------------------------------------------------------- */
 /*                                    UTILS                                   */
@@ -508,6 +509,36 @@ const parseImageParams = async ({
     const negTemplate =
       overrides?.negTemplate ?? parseImageParam(restParams, "Negative Template", false, true, "\r");
 
+    /* ----------------- "Multi Diffusion / Tiled VAE" Extension ---------------- */
+    const tiledDiffusion =
+      overrides.tiledDiffusion ?? env.TILED_DIFFUSION
+        ? {
+            batchSize: overrides.tiledDiffusion?.batchSize ?? env.TILED_DIFFUSION.batchSize,
+            keepInputSize:
+              overrides.tiledDiffusion?.keepInputSize ?? env.TILED_DIFFUSION.keepInputSize,
+            method: overrides.tiledDiffusion?.method ?? env.TILED_DIFFUSION.method,
+            overwriteSize:
+              overrides.tiledDiffusion?.overwriteSize ?? env.TILED_DIFFUSION.overwriteSize,
+            tileHeight: overrides.tiledDiffusion?.tileHeight ?? env.TILED_DIFFUSION.tileHeight,
+            tileOverlap: overrides.tiledDiffusion?.tileOverlap ?? env.TILED_DIFFUSION.tileOverlap,
+            tileWidth: overrides.tiledDiffusion?.tileWidth ?? env.TILED_DIFFUSION.tileWidth,
+          }
+        : undefined;
+
+    const tiledVAE =
+      overrides.tiledVAE ?? env.TILED_VAE
+        ? {
+            colorFixEnabled: overrides.tiledVAE?.colorFixEnabled ?? env.TILED_VAE.colorFixEnabled,
+            decoderTileSize: overrides.tiledVAE?.decoderTileSize ?? env.TILED_VAE.decoderTileSize,
+            encoderTileSize: overrides.tiledVAE?.encoderTileSize ?? env.TILED_VAE.encoderTileSize,
+            fastDecoderEnabled:
+              overrides.tiledVAE?.fastDecoderEnabled ?? env.TILED_VAE.fastDecoderEnabled,
+            fastEncoderEnabled:
+              overrides.tiledVAE?.fastEncoderEnabled ?? env.TILED_VAE.fastEncoderEnabled,
+            vaeToGPU: overrides.tiledVAE?.vaeToGPU ?? env.TILED_VAE.vaeToGPU,
+          }
+        : undefined;
+
     return {
       cfgScale,
       clipSkip,
@@ -536,6 +567,8 @@ const parseImageParams = async ({
       subseed,
       subseedStrength,
       template,
+      tiledDiffusion,
+      tiledVAE,
       width,
       vaeHash,
     };
@@ -753,6 +786,37 @@ class GenerationQueue extends PromiseQueue {
                 imageParams.cutoffPadding,
                 imageParams.cutoffInterpolation,
                 false, // debug output
+              ],
+            }
+          : undefined,
+        "Tiled Diffusion": imageParams.tiledDiffusion
+          ? {
+              args: [
+                "True", // Tiled Diffusion enabled
+                imageParams.tiledDiffusion.method, // "MultiDiffusion"
+                imageParams.tiledDiffusion.overwriteSize, // "False"
+                imageParams.tiledDiffusion.keepInputSize, // "True"
+                imageParams.width,
+                imageParams.height,
+                imageParams.tiledDiffusion.tileWidth, // 128
+                imageParams.tiledDiffusion.tileHeight, // 128
+                imageParams.tiledDiffusion.tileOverlap, // 48
+                imageParams.tiledDiffusion.batchSize, // 4
+                imageParams.hiresUpscaler,
+                imageParams.hiresScale,
+              ],
+            }
+          : undefined,
+        "Tiled VAE": imageParams.tiledVAE
+          ? {
+              args: [
+                "True", // Tiled VAE enabled
+                imageParams.tiledVAE.encoderTileSize,
+                imageParams.tiledVAE.decoderTileSize,
+                imageParams.tiledVAE.vaeToGPU,
+                imageParams.tiledVAE.fastDecoderEnabled,
+                imageParams.tiledVAE.fastEncoderEnabled,
+                imageParams.tiledVAE.colorFixEnabled,
               ],
             }
           : undefined,
@@ -1366,34 +1430,34 @@ export const segmentByKeywords = async ({
   await Promise.all(
     allImageParams.map(async (imageParams) => {
       try {
-      const testKeywords = (keywords: string[], type: "every" | "some") =>
-        keywords.length > 0
-          ? keywords[type]((keyword) =>
-              new RegExp(escapeRegEx(keyword), "im").test(imageParams.rawParams)
-            )
-          : true;
+        const testKeywords = (keywords: string[], type: "every" | "some") =>
+          keywords.length > 0
+            ? keywords[type]((keyword) =>
+                new RegExp(escapeRegEx(keyword), "im").test(imageParams.rawParams)
+              )
+            : true;
 
-      const hasAllRequired = testKeywords(requiredAllKeywords, "every");
-      const hasAnyRequired = testKeywords(requiredAnyKeywords, "some");
+        const hasAllRequired = testKeywords(requiredAllKeywords, "every");
+        const hasAnyRequired = testKeywords(requiredAnyKeywords, "some");
 
-      if (hasAllRequired && hasAnyRequired) {
+        if (hasAllRequired && hasAnyRequired) {
           const reqAll =
             requiredAllKeywords.length > 0 ? `[${requiredAllKeywords.join(" & ")}]` : "";
           const reqAny =
             requiredAnyKeywords.length > 0 ? `(${requiredAnyKeywords.join(" ~ ")})` : "";
-        const dirName = `${reqAll}${reqAll && reqAny ? " - " : ""}${reqAny}`;
-        await fs.mkdir(dirName, { recursive: true });
+          const dirName = `${reqAll}${reqAll && reqAny ? " - " : ""}${reqAny}`;
+          await fs.mkdir(dirName, { recursive: true });
 
-        await Promise.all(
-          [EXTS.IMAGE, EXTS.PARAMS].map((ext) => {
-            const filePath = `${imageParams.fileName}.${ext}`;
-            const fileName = `${path.basename(imageParams.fileName)}.${ext}`;
-            return fs.rename(filePath, path.join(dirName, fileName));
-          })
-        );
+          await Promise.all(
+            [EXTS.IMAGE, EXTS.PARAMS].map((ext) => {
+              const filePath = `${imageParams.fileName}.${ext}`;
+              const fileName = `${path.basename(imageParams.fileName)}.${ext}`;
+              return fs.rename(filePath, path.join(dirName, fileName));
+            })
+          );
 
-        segmentedCount++;
-        console.log(`Moved ${chalk.cyan(imageParams.fileName)} to ${chalk.magenta(dirName)}.`);
+          segmentedCount++;
+          console.log(`Moved ${chalk.cyan(imageParams.fileName)} to ${chalk.magenta(dirName)}.`);
         }
       } catch (err) {
         console.error(chalk.red("Error segmenting file by keywords: ", err.stack));

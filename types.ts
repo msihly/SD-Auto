@@ -42,6 +42,23 @@ export type ImageParams = {
   subseed?: number;
   subseedStrength?: number;
   template?: string;
+  tiledDiffusion?: {
+    batchSize: number;
+    keepInputSize: "True" | "False";
+    method: "MultiDiffusion" | "Mixture of Diffusers";
+    overwriteSize: "True" | "False";
+    tileHeight: number;
+    tileOverlap: number;
+    tileWidth: number;
+  };
+  tiledVAE?: {
+    colorFixEnabled: "True" | "False";
+    decoderTileSize: number;
+    encoderTileSize: number;
+    fastDecoderEnabled: "True" | "False";
+    fastEncoderEnabled: "True" | "False";
+    vaeToGPU: "True" | "False";
+  };
   vae?: string;
   vaeHash?: string;
   width?: number;
