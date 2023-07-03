@@ -13,6 +13,7 @@ export const DEFAULTS = {
   HIRES_UPSCALER: env.DEFAULT_HIRES_UPSCALER ?? "ESRGAN_4x",
   LORA_MODEL: env.DEFAULT_LORA_MODEL,
   LORA_PARAMS_PATH: env.DEFAULT_LORA_PARAMS_PATH,
+  RESTORE_FACES_STRENGTH: 0.4,
 };
 
 export const DIR_NAMES = {
@@ -24,6 +25,7 @@ export const DIR_NAMES = {
   prunedImagesOtherFolders: "Pruned Images (Other Folders)",
   prunedParams: "Pruned Params",
   reproducible: "Reproducible",
+  restoredFaces: "Restored Faces",
   upscaleCompleted: "Upscale Completed",
   upscaled: "Upscaled",
   ...(env.DIR_NAMES ?? {}),

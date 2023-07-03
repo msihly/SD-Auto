@@ -14,6 +14,23 @@ export type Auto1111FolderConfig = {
 };
 export type Auto1111FolderName = keyof Auto1111FolderConfig;
 
+export type ExtrasRequest = {
+  codeformer_visibility?: number;
+  codeformer_weight?: number;
+  extras_upscaler_2_visibility?: number;
+  gfpgan_visibility?: number;
+  image: string;
+  resize_mode?: 0 | 1;
+  show_extras_results?: boolean;
+  upscale_first?: boolean;
+  upscaler_1?: string;
+  upscaler_2?: string;
+  upscaling_crop?: boolean;
+  upscaling_resize?: number;
+  upscaling_resize_h?: number;
+  upscaling_resize_w?: number;
+};
+
 export type ImageParams = {
   cfgScale?: number;
   clipSkip?: number;
@@ -36,6 +53,7 @@ export type ImageParams = {
   prompt?: string;
   rawParams?: string;
   restoreFaces?: boolean;
+  restoreFacesStrength?: number;
   sampler?: string;
   seed?: number;
   steps?: number;

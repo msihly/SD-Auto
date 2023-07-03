@@ -18,6 +18,7 @@ import {
   pruneFilesFoundInFolders,
   pruneImageParams,
   pruneParamsAndSegmentUpscaled,
+  restoreFaces,
   segmentByDimensions,
   segmentByKeywords,
   segmentByModel,
@@ -40,6 +41,12 @@ const SCRIPT_OPTS: {
     action: (fileNames: FileNames) => generateImages({ ...fileNames, mode: "reproduce" }),
     hasRecursiveOption: true,
     label: "Reproduce",
+    needsFiles: true,
+  },
+  {
+    action: restoreFaces,
+    hasRecursiveOption: true,
+    label: "Restore Faces",
     needsFiles: true,
   },
   {

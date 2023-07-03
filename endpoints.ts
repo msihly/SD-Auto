@@ -24,6 +24,7 @@ import {
 import {
   Auto1111FolderConfig,
   Auto1111FolderName,
+  ExtrasRequest,
   FileNames,
   ImageFileNames,
   ImageParams,
@@ -318,7 +319,7 @@ const createOverridesTree = async (filePaths: string[]) => {
       overrides: cur.overrides,
     });
     return acc;
-  }, [] as { filePaths: string[]; overrides: object }[]);
+  }, [] as { filePaths: string[]; overrides: Txt2ImgOverrides }[]);
 };
 
 const loadTxt2ImgOverrides = async (dirPath: string = ".") => {
@@ -406,7 +407,7 @@ const parseImageParams = async ({
   models: Model[];
   overrides?: Txt2ImgOverrides;
   paramFileName: string;
-}) => {
+}): Promise<ImageParams> => {
   try {
     const fileName = path.join(
       path.dirname(paramFileName),
@@ -441,13 +442,14 @@ const parseImageParams = async ({
     /* ------------------------------ Main Settings ----------------------------- */
     const cfgScale = overrides?.cfgScale ?? parseImageParam(restParams, "CFG scale", true);
     const clipSkip = overrides?.clipSkip ?? parseImageParam(restParams, "Clip skip", true, true);
-    const hasRestoreFaces = overrides?.restoreFaces ?? !!restParams.includes("Face restoration");
     const hiresDenoisingStrength =
       overrides?.hiresDenoisingStrength ?? DEFAULTS.HIRES_DENOISING_STRENGTH;
     const hiresScale = overrides?.hiresScale ?? DEFAULTS.HIRES_SCALE;
     const hiresSteps =
       overrides?.hiresSteps ?? parseImageParam(restParams, "Hires steps", true, true);
     const hiresUpscaler = overrides?.hiresUpscaler ?? DEFAULTS.HIRES_UPSCALER;
+    const restoreFaces = overrides?.restoreFaces ?? !!restParams.includes("Face restoration");
+    const restoreFacesStrength = overrides?.restoreFacesStrength ?? DEFAULTS.RESTORE_FACES_STRENGTH;
     const sampler = overrides?.sampler ?? parseImageParam(restParams, "Sampler", false);
     const seed = overrides?.seed ?? parseImageParam(restParams, "Seed", true);
     const steps = overrides?.steps ?? parseImageParam(restParams, "Steps", true);
@@ -550,7 +552,6 @@ const parseImageParams = async ({
       cutoffStrong,
       cutoffInterpolation,
       fileName,
-      hasRestoreFaces,
       height,
       hiresDenoisingStrength,
       hiresScale,
@@ -561,6 +562,8 @@ const parseImageParams = async ({
       negTemplate,
       prompt,
       rawParams: imageParams,
+      restoreFaces,
+      restoreFacesStrength,
       sampler,
       seed,
       steps,
@@ -870,10 +873,10 @@ class GenerationQueue extends PromiseQueue {
     this.progressInterval = setInterval(async () => {
       const res = await API.Auto1111.get("progress");
       if (!res.success) return;
-      this.progress.update(res.data.progress, {
+      this.progress.update(Math.min(0.99, res.data.progress), {
         formattedETA: `${round(+res.data.eta_relative)}s`,
       });
-    }, 750);
+    }, 500);
   }
 
   stopProgress() {
@@ -882,27 +885,8 @@ class GenerationQueue extends PromiseQueue {
     this.progress.stop();
   }
 
-  private async txt2Img(txt2ImgRequest: Txt2ImgRequest, imageParams: ImageParams) {
-    const res = await API.Auto1111.post("txt2img", {
-      headers: { "Content-Type": "application/json" },
-      data: txt2ImgRequest,
-    });
-    if (!res.success) throw new Error(res.error);
-
-    const { negTemplate, template } = imageParams;
-    return {
-      imageBuffer: Buffer.from(res.data?.images[0], "base64"),
-      params:
-        (JSON.parse(res.data?.info).infotexts[0] as string) +
-        (template ? `\nTemplate: ${template}` : "") +
-        (negTemplate ? `\nNegative Template: ${negTemplate}` : ""),
-    };
-  }
-
   async reproduce(txt2ImgRequest: Txt2ImgRequest, imageParams: ImageParams) {
     try {
-      this.startProgress();
-
       const { imageFileName, paramFileName } = extendFileName(imageParams.fileName);
 
       const res = await this.txt2Img(txt2ImgRequest, imageParams);
@@ -934,8 +918,6 @@ class GenerationQueue extends PromiseQueue {
         )
       );
 
-      this.stopProgress();
-
       console.log(
         `\n${chalk.cyan(imageParams.fileName)} moved to ${chalk[
           isReproducible ? "green" : "yellow"
@@ -947,32 +929,23 @@ class GenerationQueue extends PromiseQueue {
     }
   }
 
-  async upscale(txt2ImgRequest: Txt2ImgRequest, imageParams: ImageParams) {
-    try {
-      this.startProgress();
+  async restoreFaces(extrasRequest: ExtrasRequest, withThrow = false) {
+    const res = await API.Auto1111.post("extra-single-image", {
+      headers: { "Content-Type": "application/json" },
+      data: extrasRequest,
+    });
 
-      const outputDir = DIR_NAMES.upscaled;
-      const sourcesDir = DIR_NAMES.upscaleCompleted;
-      await Promise.all([outputDir, sourcesDir].map((dir) => fs.mkdir(dir, { recursive: true })));
-
-      const { imageFileName, paramFileName } = extendFileName(imageParams.fileName);
-      const res = await this.txt2Img(txt2ImgRequest, imageParams);
-      await Promise.all([
-        fs.writeFile(path.join(outputDir, path.basename(imageFileName)), res.imageBuffer),
-        fs.writeFile(path.join(outputDir, path.basename(paramFileName)), res.params),
-      ]);
-
-      await Promise.all(
-        [imageFileName, paramFileName].map((fileName) =>
-          fs.rename(fileName, path.join(sourcesDir, path.basename(fileName)))
-        )
-      );
-
-      this.stopProgress();
-    } catch (err) {
-      this.stopProgress();
-      console.error(chalk.red(err.stack));
+    if (!res.success) {
+      const errorMsg = `Failed to restore faces: ${res.error}`;
+      if (withThrow) throw new Error(errorMsg);
+      else {
+        console.warn(chalk.yellow(errorMsg));
+        return { success: false, error: res.error };
+      }
     }
+
+    const imageBase64: string = res.data?.image;
+    return { success: true, imageBase64 };
   }
 
   async switchModelIfNeeded(modelName: string, models: Model[], fileName: string) {
@@ -1019,6 +992,60 @@ class GenerationQueue extends PromiseQueue {
       }
 
       console.log(chalk.green("Active VAE updated."));
+    }
+  }
+
+  private async txt2Img(txt2ImgRequest: Txt2ImgRequest, imageParams: ImageParams) {
+    this.startProgress();
+    const txt2ImgRes = await API.Auto1111.post("txt2img", {
+      headers: { "Content-Type": "application/json" },
+      data: { ...txt2ImgRequest, restore_faces: false },
+    });
+    this.stopProgress();
+
+    if (!txt2ImgRes.success) throw new Error(txt2ImgRes.error);
+    let imageBase64 = txt2ImgRes.data?.images[0];
+
+    if (imageParams.restoreFaces) {
+      const res = await this.restoreFaces({
+        codeformer_visibility: imageParams.restoreFacesStrength,
+        image: imageBase64,
+      });
+      if (res.success) imageBase64 = res.imageBase64;
+    }
+
+    const { negTemplate, template } = imageParams;
+    return {
+      imageBase64: imageBase64,
+      imageBuffer: Buffer.from(imageBase64, "base64"),
+      params:
+        (JSON.parse(txt2ImgRes.data?.info).infotexts[0] as string) +
+        (template ? `\nTemplate: ${template}` : "") +
+        (negTemplate ? `\nNegative Template: ${negTemplate}` : ""),
+    };
+  }
+
+  async upscale(txt2ImgRequest: Txt2ImgRequest, imageParams: ImageParams) {
+    try {
+      const outputDir = DIR_NAMES.upscaled;
+      const sourcesDir = DIR_NAMES.upscaleCompleted;
+      await Promise.all([outputDir, sourcesDir].map((dir) => fs.mkdir(dir, { recursive: true })));
+
+      const { imageFileName, paramFileName } = extendFileName(imageParams.fileName);
+      const res = await this.txt2Img(txt2ImgRequest, imageParams);
+      await Promise.all([
+        fs.writeFile(path.join(outputDir, path.basename(imageFileName)), res.imageBuffer),
+        fs.writeFile(path.join(outputDir, path.basename(paramFileName)), res.params),
+      ]);
+
+      await Promise.all(
+        [imageFileName, paramFileName].map((fileName) =>
+          fs.rename(fileName, path.join(sourcesDir, path.basename(fileName)))
+        )
+      );
+    } catch (err) {
+      this.stopProgress();
+      console.error(chalk.red(err.stack));
     }
   }
 }
@@ -1198,23 +1225,28 @@ export const generateTxt2ImgOverrides = async () => {
     if (index > 0 && index <= options.length) overrides[optName] = options[index - 1].value;
   };
 
+  const [models, samplers, upscalers, vaes] = await Promise.all([
+    (await listModels()).map((m) => m.name),
+    listSamplers(),
+    listUpscalers(),
+    listVAEs(),
+  ]);
+
   await numericalPrompt("Enter CFG Scale", "cfgScale");
   await numericalPrompt("Enter Clip Skip", "clipSkip");
-  await numericalPrompt("Enter Denoising Strength", "hiresDenoisingStrength");
+  await numericalPrompt("Enter Hires Denoising Strength", "hiresDenoisingStrength");
   await numericalPrompt("Enter Hires Scale", "hiresScale");
   await numericalPrompt("Enter Hires Steps", "hiresSteps");
-  const models = (await listModels()).map((m) => m.name);
   await numListPrompt("Model", "model", valsToOpts(models));
   await booleanPrompt("Restore Faces?", "restoreFaces");
-  const samplers = await listSamplers();
+  if (overrides.restoreFaces)
+    await numericalPrompt("Restore Faces Strength", "restoreFacesStrength");
   await numListPrompt("Sampler", "sampler", valsToOpts(samplers));
   await numericalPrompt("Enter Seed", "seed");
   await numericalPrompt("Enter Steps", "steps");
   await numericalPrompt("Enter Subseed", "subseed");
   await numericalPrompt("Enter Subseed Strength", "subseedStrength");
-  const upscalers = await listUpscalers();
   await numListPrompt("Upscaler", "hiresUpscaler", valsToOpts(upscalers));
-  const vaes = await listVAEs();
   await numListPrompt(
     "VAE",
     "vae",
@@ -1365,6 +1397,81 @@ export const pruneParamsAndSegmentUpscaled = async (fileNames: FileNames) => {
     console.error(chalk.red(err));
   } finally {
     mainEmitter.emit("done");
+  }
+};
+
+export const restoreFaces = async ({ imageFileNames }: ImageFileNames) => {
+  try {
+    const perfStart = performance.now();
+
+    let completedCount = 0;
+    let errorCount = 0;
+    const totalCount = imageFileNames.length;
+    if (totalCount === 0) mainEmitter.emit("done");
+
+    const overridesTree = await createOverridesTree(
+      imageFileNames.map((f) => `${f}.${EXTS.IMAGE}`)
+    );
+
+    overridesTree.forEach(({ filePaths, overrides }) =>
+      filePaths.forEach((filePath) => {
+        const fileName = path.basename(filePath, `.${EXTS.IMAGE}`);
+
+        GenQueue.add(async () => {
+          const iterationPerfStart = performance.now();
+
+          const handleCompletion = () => {
+            console.log(
+              `${chalk.cyan(completedCount + errorCount)} / ${chalk.grey(
+                totalCount
+              )} completed in ${makeTimeLog(performance.now() - iterationPerfStart)}.\n${chalk.grey(
+                "-".repeat(100)
+              )}`
+            );
+
+            if (completedCount + errorCount === totalCount) {
+              const totalTimeElapsed = performance.now() - perfStart;
+              console.log(
+                `Completed: ${chalk.green(completedCount)}. Errors: ${chalk.red(
+                  errorCount
+                )}. Total time: ${makeTimeLog(totalTimeElapsed)}.`
+              );
+              mainEmitter.emit("done");
+            }
+          };
+
+          try {
+            console.log(`Restoring faces for ${chalk.cyan(fileName)}...`);
+
+            const image = await fs.readFile(`${fileName}.${EXTS.IMAGE}`, { encoding: "base64" });
+            const res = await GenQueue.restoreFaces({
+              codeformer_visibility:
+                overrides.restoreFacesStrength ?? DEFAULTS.RESTORE_FACES_STRENGTH,
+              image,
+            });
+
+            if (!res.success) {
+              errorCount++;
+              throw new Error(res.error);
+            } else {
+              const name = path.basename(`${fileName}.${EXTS.IMAGE}`);
+              const filePath = path.join(DIR_NAMES.restoredFaces, name);
+              await fs.mkdir(path.dirname(filePath), { recursive: true });
+              await fs.writeFile(filePath, Buffer.from(res.imageBase64, "base64"));
+
+              completedCount++;
+              handleCompletion();
+            }
+          } catch (err) {
+            GenQueue.stopProgress();
+            console.error(chalk.red(err.stack));
+            handleCompletion();
+          }
+        });
+      })
+    );
+  } catch (err) {
+    console.error(chalk.red(err.stack));
   }
 };
 
