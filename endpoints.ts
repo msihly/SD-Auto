@@ -361,6 +361,43 @@ const loadLoraTrainingParams = async (filePath: string) => {
 export const makeTimeLog = (time: number) =>
   `${chalk.green(dayjs.duration(time).format("H[h]m[m]s[s]"))} ${chalk.grey(`(${round(time)}ms)`)}`;
 
+/* -------------------------- Move Files To Folder -------------------------- */
+const moveFilesToFolder = async ({
+  filePath,
+  folderColor = "magenta",
+  folderName,
+  exts,
+  withConsole = true,
+}: {
+  filePath: string;
+  folderColor?: "cyan" | "green" | "magenta" | "red" | "yellow";
+  folderName: string;
+  exts: string[];
+  withConsole?: boolean;
+}) => {
+  try {
+    const dirName = path.join(folderName, path.dirname(filePath));
+    await fs.mkdir(dirName, { recursive: true });
+
+    await Promise.all(
+      exts.map((ext) => {
+        const fileName = `${path.basename(filePath, `.${ext}`)}.${ext}`;
+        return fs.rename(
+          `${filePath.replace(new RegExp(`\.${ext}$`, "i"), "")}.${ext}`,
+          path.join(dirName, fileName)
+        );
+      })
+    );
+
+    if (withConsole)
+      console.log(`Moved ${chalk.cyan(filePath)} to ${chalk[folderColor](dirName)}.`);
+
+    return dirName;
+  } catch (err) {
+    console.error(chalk.red(err.stack));
+  }
+};
+
 /* -------------------- Parse Image Generation Parameter -------------------- */
 const parseImageParam = <IsNum extends boolean>(
   imageParams: string,
@@ -1116,6 +1153,8 @@ export const generateImages = async ({
           );
 
           if (isComplete) {
+            await removeEmptyFolders();
+
             const totalTimeElapsed = performance.now() - perfStart;
             console.log(
               `All ${chalk.cyan(totalCount)} images completed in ${makeTimeLog(totalTimeElapsed)}.`
@@ -1483,17 +1522,13 @@ export const segmentByDimensions = async ({ imageFileNames, noEmit }: ImageFileN
     imageFileNames.map(async (name) => {
       try {
         const { height, width } = await sharp(`${name}.${EXTS.IMAGE}`).metadata();
-        const dirName = path.join(`${height} x ${width}`, path.dirname(name));
-        await fs.mkdir(dirName, { recursive: true });
+        const folderName = `${height} x ${width}`;
 
-        await Promise.all(
-          [EXTS.IMAGE, EXTS.PARAMS].map((ext) => {
-            const fileName = `${name}.${ext}`;
-            return fs.rename(fileName, path.join(dirName, path.basename(fileName)));
-          })
-        );
-
-        console.log(`Moved ${chalk.cyan(name)} to ${chalk.magenta(dirName)}.`);
+        await moveFilesToFolder({
+          filePath: name,
+          folderName,
+          exts: [EXTS.IMAGE, EXTS.PARAMS],
+        });
       } catch (err) {
         console.error(chalk.red("Error segmenting file by dimensions: ", err.stack));
       }
@@ -1502,6 +1537,7 @@ export const segmentByDimensions = async ({ imageFileNames, noEmit }: ImageFileN
 
   await removeEmptyFolders();
 
+  console.log(chalk.cyan(imageFileNames.length), chalk.green(" files segmented by dimensions."));
   if (!noEmit) mainEmitter.emit("done");
 };
 
@@ -1552,19 +1588,14 @@ export const segmentByKeywords = async ({
             requiredAllKeywords.length > 0 ? `[${requiredAllKeywords.join(" & ")}]` : "";
           const reqAny =
             requiredAnyKeywords.length > 0 ? `(${requiredAnyKeywords.join(" ~ ")})` : "";
-          const dirName = `${reqAll}${reqAll && reqAny ? " - " : ""}${reqAny}`;
-          await fs.mkdir(dirName, { recursive: true });
 
-          await Promise.all(
-            [EXTS.IMAGE, EXTS.PARAMS].map((ext) => {
-              const filePath = `${imageParams.fileName}.${ext}`;
-              const fileName = `${path.basename(imageParams.fileName)}.${ext}`;
-              return fs.rename(filePath, path.join(dirName, fileName));
-            })
-          );
+          await moveFilesToFolder({
+            filePath: imageParams.fileName,
+            folderName: `${reqAll}${reqAll && reqAny ? " - " : ""}${reqAny}`,
+            exts: [EXTS.IMAGE, EXTS.PARAMS],
+          });
 
           segmentedCount++;
-          console.log(`Moved ${chalk.cyan(imageParams.fileName)} to ${chalk.magenta(dirName)}.`);
         }
       } catch (err) {
         console.error(chalk.red("Error segmenting file by keywords: ", err.stack));
@@ -1590,23 +1621,17 @@ export const segmentByModel = async ({
 
   await Promise.all(
     allImageParams.map(async ({ fileName, model }) => {
-      const dirName = path.dirname(fileName);
-      await fs.mkdir(path.join(model, dirName), { recursive: true });
-
-      await Promise.all(
-        [EXTS.IMAGE, EXTS.PARAMS].map((ext) => {
-          const name = `${fileName}.${ext}`;
-          return fs.rename(name, path.join(model, name));
-        })
-      );
-
-      console.log(`Moved ${chalk.cyan(fileName)} to ${chalk.magenta(model)}.`);
+      await moveFilesToFolder({
+        filePath: fileName,
+        folderName: model,
+        exts: [EXTS.IMAGE, EXTS.PARAMS],
+      });
     })
   );
 
   await removeEmptyFolders();
 
-  console.log(chalk.green("Files segmented by model."));
+  console.log(chalk.cyan(allImageParams.length), chalk.green(" files segmented by model."));
   if (!noEmit) mainEmitter.emit("done");
 };
 
@@ -1614,34 +1639,22 @@ export const segmentByModel = async ({
 export const segmentByUpscaled = async ({ paramFileNames, noEmit }: ParamFileNames & NoEmit) => {
   console.log("Segmenting by upscaled...");
 
-  await Promise.all([
-    fs.mkdir(DIR_NAMES.upscaled, { recursive: true }),
-    fs.mkdir(DIR_NAMES.nonUpscaled, { recursive: true }),
-  ]);
-
   let upscaledCount = 0;
   let nonUpscaledCount = 0;
 
   await Promise.all(
     paramFileNames.map(async (fileName) => {
       const imageParams = await fs.readFile(`${fileName}.${EXTS.PARAMS}`);
-      const targetPath = imageParams.includes("Hires upscaler")
-        ? DIR_NAMES.upscaled
-        : DIR_NAMES.nonUpscaled;
-      const isUpscaled = targetPath === DIR_NAMES.upscaled;
+      const isUpscaled = imageParams.includes("Hires upscaler");
+      const folderName = isUpscaled ? DIR_NAMES.upscaled : DIR_NAMES.nonUpscaled;
       isUpscaled ? upscaledCount++ : nonUpscaledCount++;
 
-      const filePath = path.join(targetPath, fileName);
-      await fs.mkdir(path.dirname(filePath), { recursive: true });
-
-      await Promise.all(
-        [EXTS.IMAGE, EXTS.PARAMS].map((ext) =>
-          fs.rename(`${fileName}.${ext}`, `${filePath}.${ext}`)
-        )
-      );
-      console.log(
-        `Moved ${chalk.cyan(fileName)} to ${(isUpscaled ? chalk.green : chalk.yellow)(targetPath)}.`
-      );
+      await moveFilesToFolder({
+        folderColor: isUpscaled ? "green" : "yellow",
+        folderName,
+        filePath: fileName,
+        exts: [EXTS.IMAGE, EXTS.PARAMS],
+      });
     })
   );
 
