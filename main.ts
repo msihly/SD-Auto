@@ -1,9 +1,10 @@
 import chalk from "chalk";
 import { prompt, readline } from "./utils";
+import { DIR_NAMES, FILE_AND_DIR_NAMES, FILE_NAMES } from "./constants";
 import { FileNames } from "./types";
 import {
   convertImagesInCurDirToJPG,
-  generateBatches,
+  flattenFolders,
   generateImages,
   generateLoraTrainingFolderAndParams,
   generateTxt2ImgOverrides,
@@ -15,19 +16,23 @@ import {
   listSamplers,
   listUpscalers,
   listVAEs,
-  pruneFilesFoundInFolders,
   pruneImageParams,
-  pruneParamsAndSegmentUpscaled,
+  pruneImages,
+  removeEmptyFoldersAction,
   restoreFaces,
+  segmentByBatches,
   segmentByDimensions,
+  segmentByFilename,
   segmentByKeywords,
   segmentByModel,
+  segmentByModelHashSeed,
   segmentByUpscaled,
 } from "./endpoints";
 
 const SCRIPT_OPTS: {
-  action: ({ imageFileNames, paramFileNames }?: FileNames) => any;
+  action: ({ imageFileNames, paramFileNames }?: FileNames) => Promise<any>;
   hasRecursiveOption?: boolean;
+  nameExceptions?: string[];
   needsFiles: boolean;
   label: string;
 }[] = [
@@ -47,12 +52,12 @@ const SCRIPT_OPTS: {
     action: restoreFaces,
     hasRecursiveOption: true,
     label: "Restore Faces",
-    needsFiles: true,
-  },
-  {
-    action: pruneParamsAndSegmentUpscaled,
-    hasRecursiveOption: true,
-    label: "Prune Generation Parameters & Segment by Upscaled",
+    nameExceptions: [
+      DIR_NAMES.NON_UPSCALED,
+      DIR_NAMES.UPSCALED,
+      FILE_NAMES.ORIGINAL,
+      FILE_NAMES.UPSCALED,
+    ],
     needsFiles: true,
   },
   {
@@ -62,32 +67,58 @@ const SCRIPT_OPTS: {
     needsFiles: true,
   },
   {
-    action: pruneFilesFoundInFolders,
-    label: "Prune Files Found in Other Folders",
+    action: pruneImages,
+    hasRecursiveOption: true,
+    label: "Prune Images",
+    needsFiles: true,
+  },
+  {
+    action: segmentByBatches,
+    hasRecursiveOption: true,
+    label: "Segment by Batches",
+    nameExceptions: FILE_AND_DIR_NAMES,
     needsFiles: true,
   },
   {
     action: segmentByDimensions,
     hasRecursiveOption: true,
     label: "Segment by Dimensions",
+    nameExceptions: FILE_AND_DIR_NAMES,
+    needsFiles: true,
+  },
+  {
+    action: segmentByFilename,
+    hasRecursiveOption: true,
+    label: "Segment by Filename",
+    nameExceptions: [...Object.values(DIR_NAMES)],
     needsFiles: true,
   },
   {
     action: segmentByKeywords,
     hasRecursiveOption: true,
     label: "Segment by Keywords",
+    nameExceptions: FILE_AND_DIR_NAMES,
     needsFiles: true,
   },
   {
     action: segmentByModel,
     hasRecursiveOption: true,
     label: "Segment by Model",
+    nameExceptions: FILE_AND_DIR_NAMES,
+    needsFiles: true,
+  },
+  {
+    action: segmentByModelHashSeed,
+    hasRecursiveOption: true,
+    label: "Segment by ModelHash-Seed",
+    nameExceptions: FILE_AND_DIR_NAMES,
     needsFiles: true,
   },
   {
     action: segmentByUpscaled,
     hasRecursiveOption: true,
     label: "Segment by Upscaled",
+    nameExceptions: FILE_AND_DIR_NAMES,
     needsFiles: true,
   },
   {
@@ -99,18 +130,6 @@ const SCRIPT_OPTS: {
     action: generateLoraTrainingFolderAndParams,
     label: "Generate Lora Training Folder and Params",
     needsFiles: false,
-  },
-  {
-    action: generateBatches,
-    hasRecursiveOption: true,
-    label: "Generate Batches Exhaustively",
-    needsFiles: true,
-  },
-  {
-    action: (fileNames: FileNames) => generateBatches({ ...fileNames, shuffle: true }),
-    hasRecursiveOption: true,
-    label: "Generate Batches Exhaustively (Shuffled)",
-    needsFiles: true,
   },
   {
     action: convertImagesInCurDirToJPG,
@@ -152,6 +171,16 @@ const SCRIPT_OPTS: {
     label: "Initialize Automatic1111 Folders (Symlinks)",
     needsFiles: false,
   },
+  {
+    action: flattenFolders,
+    label: "Flatten Folders",
+    needsFiles: false,
+  },
+  {
+    action: removeEmptyFoldersAction,
+    label: "Remove Empty Folders",
+    needsFiles: true,
+  },
 ];
 
 export const main = async () => {
@@ -163,25 +192,35 @@ export const main = async () => {
             opt.hasRecursiveOption ? chalk.magenta(" (r)") : ""
           }`
       ).join("\n")}\n${chalk.red("  0:")} Exit\n${chalk.blueBright(
-        `Select an option ${chalk.grey("(with --r flag for recursion)")}: `
+        `Select an option ${chalk.grey("(--r for recursion, commas for chaining)")}: `
       )}`
     );
 
-    const scriptIndex = +input.replace(/\D+/gi, "");
+    const scriptIndices = input
+      .replace(/[^\d,]+/gi, "")
+      .split(",")
+      .map((i) => +i)
+      .filter((i) => !isNaN(i));
+    if (!scriptIndices.length)
+      throw new Error(
+        `Invalid selection. Only comma-delineated numbers between 0 and ${SCRIPT_OPTS.length} allowed.`
+      );
 
-    if (isNaN(scriptIndex) || scriptIndex < 0 || scriptIndex > SCRIPT_OPTS.length)
-      throw new Error(`Invalid selection. Enter a number between 0 and ${SCRIPT_OPTS.length}.`);
+    for (const scriptIndex of scriptIndices) {
+      if (isNaN(scriptIndex) || scriptIndex < 0 || scriptIndex > SCRIPT_OPTS.length)
+        throw new Error(`Invalid selection. Enter a number between 0 and ${SCRIPT_OPTS.length}.`);
 
-    if (scriptIndex === 0) return readline.close();
+      if (scriptIndex === 0) return readline.close();
 
-    const script = SCRIPT_OPTS[scriptIndex - 1];
-    if (!script) throw new Error("Failed to find matching script.");
+      const script = SCRIPT_OPTS[scriptIndex - 1];
+      if (!script) throw new Error("Failed to find matching script.");
 
-    if (script.needsFiles) {
-      const withRecursion = script.hasRecursiveOption && input.includes("--r");
-      const fileNames = await listImageAndParamFileNames(withRecursion);
-      script.action(fileNames);
-    } else script.action();
+      if (script.needsFiles) {
+        const withRecursion = script.hasRecursiveOption && input.includes("--r");
+        const fileNames = await listImageAndParamFileNames(withRecursion, script.nameExceptions);
+        await script.action(fileNames);
+      } else await script.action();
+    }
   } catch (err) {
     console.error(chalk.red(err));
     console.log(chalk.grey("-".repeat(100)));

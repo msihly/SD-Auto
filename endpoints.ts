@@ -1,4 +1,4 @@
-import fs from "fs/promises";
+import fs from "fs-extra";
 import EventEmitter from "events";
 import path from "path";
 import { performance } from "perf_hooks";
@@ -15,9 +15,13 @@ import {
   DEFAULTS,
   DIR_NAMES,
   EXTS,
+  FILE_AND_DIR_NAMES,
+  FILE_NAMES,
   LORA,
   OUTPUT_DIR,
   REPROD_DIFF_TOLERANCE,
+  RESTORE_FACES_TYPES,
+  RestoreFacesType,
   TXT2IMG_OVERRIDES_FILE_NAME,
   VAE_DIR,
 } from "./constants";
@@ -28,6 +32,7 @@ import {
   FileNames,
   ImageFileNames,
   ImageParams,
+  Img2ImgRequest,
   LoraTrainingParams,
   Model,
   NoEmit,
@@ -40,7 +45,6 @@ import {
   VAE,
 } from "./types";
 import {
-  Image,
   PromiseQueue,
   TreeNode,
   chunkArray,
@@ -50,27 +54,32 @@ import {
   delimit,
   dirToFilePaths,
   doesPathExist,
+  dotKeysToTree,
   escapeRegEx,
+  extendFileName,
   getImagesInFolders,
+  listImagesFoundInOtherFolders,
   makeConsoleList,
+  makeDirs,
   makeExistingValueLog,
+  makeFilePathInDir,
+  makeTimeLog,
+  moveFile,
+  moveFilesToFolder,
   prompt,
   randomSort,
   removeEmptyFolders,
   round,
   sha256File,
+  sleep,
   valsToOpts,
+  writeFilesToFolder,
 } from "./utils";
 import env from "./env";
 
 /* -------------------------------------------------------------------------- */
 /*                                    UTILS                                   */
 /* -------------------------------------------------------------------------- */
-const extendFileName = (fileName: string) => ({
-  imageFileName: `${fileName}.${EXTS.IMAGE}`,
-  paramFileName: `${fileName}.${EXTS.PARAMS}`,
-});
-
 /* ------------------------------ Main Emitter ------------------------------ */
 const mainEmitter = new EventEmitter();
 
@@ -97,7 +106,9 @@ const apiCall = async (
       : err.stack;
 
     if (withThrow) throw new Error(errMsg);
-    console.error(chalk.red(`[API Error::${method}] ${endpoint} - ${config}\n${errMsg}`));
+    console.error(
+      chalk.red(`[API Error::${method}] ${endpoint} - ${JSON.stringify(config, null, 2)}\n`, errMsg)
+    );
     return { success: false, error: errMsg };
   }
 };
@@ -114,10 +125,8 @@ export const getActiveModel = async (withConsole = false, withEmit = false) => {
   const res = await API.Auto1111.get("options");
   if (!res.success) return;
 
-  const model = (res.data?.sd_model_checkpoint as string)
-    .replace(/\\/gi, "_")
-    .replace(/(\.(ckpt|checkpoint|safetensors))|(\[.+\]$)/gi, "")
-    .trim();
+  const modelHash = res.data?.sd_checkpoint_hash as string;
+  const model = (await listModels()).find((m) => m.hash === modelHash)?.name;
   if (withConsole) console.log("Active model: ", chalk.cyan(model));
   if (withEmit) mainEmitter.emit("done");
   return model;
@@ -142,20 +151,22 @@ export const interruptGeneration = async (withConsole = false) => {
 };
 
 /* -------------- Get Image and Generatiom Parameter File Names ------------- */
-export const listImageAndParamFileNames = async (withRecursiveFiles = false) => {
+export const listImageAndParamFileNames = async (
+  withRecursiveFiles = false,
+  exceptions = [DIR_NAMES.NON_UPSCALED, DIR_NAMES.REPRODUCIBLE, FILE_NAMES.ORIGINAL]
+) => {
   console.log(`Reading files${withRecursiveFiles ? " (recursively)" : ""}...`);
 
-  const regExFilter = new RegExp(
-    Object.values(DIR_NAMES)
-      .filter((dirName) => ![DIR_NAMES.nonUpscaled, DIR_NAMES.reproducible].includes(dirName))
-      .map((dirName) => escapeRegEx(dirName))
-      .join("|"),
-    "im"
-  );
+  const regExNames = FILE_AND_DIR_NAMES.filter((name) => !exceptions.includes(name));
+  const hasExclusions = !!regExNames.length;
+  const regExFilter = hasExclusions
+    ? new RegExp(regExNames.map((name) => escapeRegEx(name)).join("|"), "im")
+    : null;
 
-  const files = (await (withRecursiveFiles ? dirToFilePaths(".") : fs.readdir("."))).filter(
-    (filePath) => !regExFilter.test(filePath)
-  );
+  const allFiles = await (withRecursiveFiles ? dirToFilePaths(".") : fs.readdir("."));
+  const files = hasExclusions
+    ? allFiles.filter((filePath) => !regExFilter.test(filePath))
+    : allFiles;
 
   const [imageFileNames, paramFileNames] = files.reduce(
     (acc, cur) => {
@@ -175,31 +186,6 @@ export const listImageAndParamFileNames = async (withRecursiveFiles = false) => 
   );
 
   return { imageFileNames, paramFileNames };
-};
-
-/* ---------------------- List Images Found In Other Folders --------------------- */
-const listImagesFoundInOtherFolders = ({
-  imageFileNames,
-  imagesInOtherFolders,
-  withConsole = false,
-}: ImageFileNames & { imagesInOtherFolders: Image[]; withConsole?: boolean }) => {
-  const images = imageFileNames.reduce((acc, cur) => {
-    const imageInOtherFolder = imagesInOtherFolders.find((img) => img.name === cur);
-    if (!imageInOtherFolder) return acc;
-    else acc.push(imageInOtherFolder);
-    return acc;
-  }, [] as Image[]);
-
-  if (withConsole)
-    console.log(
-      `Images in current folder and other folders:\n${chalk.cyan(
-        makeConsoleList(
-          images.map((img) => `Name: ${img.name}. Hash: ${img.hashMD5}. Path: ${img.path}.`)
-        )
-      )}`
-    );
-
-  return images;
 };
 
 /* ---------------------- List Models ---------------------- */
@@ -315,7 +301,7 @@ const createOverridesTree = async (filePaths: string[]) => {
     if (!cur.fileNames.length) return acc;
 
     acc.push({
-      filePaths: cur.fileNames.map((fileName) => path.join(cur.dirPath, fileName)),
+      filePaths: cur.fileNames.map((fileName) => makeFilePathInDir(cur.dirPath, fileName)),
       overrides: cur.overrides,
     });
     return acc;
@@ -326,7 +312,11 @@ const loadTxt2ImgOverrides = async (dirPath: string = ".") => {
   try {
     const filePath = path.resolve(dirPath, TXT2IMG_OVERRIDES_FILE_NAME);
     if (!(await doesPathExist(filePath))) return {};
-    else return JSON.parse(await fs.readFile(filePath, { encoding: "utf8" })) as Txt2ImgOverrides;
+    else {
+      return dotKeysToTree<Txt2ImgOverrides>(
+        JSON.parse(await fs.readFile(filePath, { encoding: "utf8" }))
+      );
+    }
   } catch (err) {
     console.error(chalk.red("Error reading txt2img overrides: ", err.stack));
     return {};
@@ -354,47 +344,6 @@ const loadLoraTrainingParams = async (filePath: string) => {
   } catch (err) {
     console.error(chalk.red("Error reading lora training params: ", err.stack));
     return {};
-  }
-};
-
-/* -------------------------- Make Time Console Log ------------------------- */
-export const makeTimeLog = (time: number) =>
-  `${chalk.green(dayjs.duration(time).format("H[h]m[m]s[s]"))} ${chalk.grey(`(${round(time)}ms)`)}`;
-
-/* -------------------------- Move Files To Folder -------------------------- */
-const moveFilesToFolder = async ({
-  filePath,
-  folderColor = "magenta",
-  folderName,
-  exts,
-  withConsole = true,
-}: {
-  filePath: string;
-  folderColor?: "cyan" | "green" | "magenta" | "red" | "yellow";
-  folderName: string;
-  exts: string[];
-  withConsole?: boolean;
-}) => {
-  try {
-    const dirName = path.join(folderName, path.dirname(filePath));
-    await fs.mkdir(dirName, { recursive: true });
-
-    await Promise.all(
-      exts.map((ext) => {
-        const fileName = `${path.basename(filePath, `.${ext}`)}.${ext}`;
-        return fs.rename(
-          `${filePath.replace(new RegExp(`\.${ext}$`, "i"), "")}.${ext}`,
-          path.join(dirName, fileName)
-        );
-      })
-    );
-
-    if (withConsole)
-      console.log(`Moved ${chalk.cyan(filePath)} to ${chalk[folderColor](dirName)}.`);
-
-    return dirName;
-  } catch (err) {
-    console.error(chalk.red(err.stack));
   }
 };
 
@@ -451,7 +400,9 @@ const parseImageParams = async ({
       path.basename(paramFileName, path.extname(paramFileName))
     );
 
-    const imageParams = await fs.readFile(`${fileName}.${EXTS.PARAMS}`, { encoding: "utf8" });
+    const imageParams = await fs.readFile(extendFileName(fileName, EXTS.PARAMS), {
+      encoding: "utf8",
+    });
 
     const negPromptEndIndex = imageParams.indexOf("Steps: ");
     let negPromptStartIndex = imageParams.indexOf("Negative prompt: ");
@@ -470,9 +421,7 @@ const parseImageParams = async ({
     if (!model) {
       model = rawModelName;
       console.log(
-        chalk.yellow(
-          `Invalid model name ${chalk.yellow(rawModelName)} found for ${chalk.cyan(paramFileName)}.`
-        )
+        `Invalid model name ${chalk.yellow(rawModelName)} found for ${chalk.cyan(paramFileName)}.`
       );
     }
 
@@ -480,11 +429,16 @@ const parseImageParams = async ({
     const cfgScale = overrides?.cfgScale ?? parseImageParam(restParams, "CFG scale", true);
     const clipSkip = overrides?.clipSkip ?? parseImageParam(restParams, "Clip skip", true, true);
     const hiresDenoisingStrength =
-      overrides?.hiresDenoisingStrength ?? DEFAULTS.HIRES_DENOISING_STRENGTH;
-    const hiresScale = overrides?.hiresScale ?? DEFAULTS.HIRES_SCALE;
+      overrides?.hiresDenoisingStrength ??
+      parseImageParam(restParams, "Hires denoising strength", true, true);
+    const hiresScale =
+      overrides?.hiresScale ?? parseImageParam(restParams, "Hires scale", true, true);
     const hiresSteps =
       overrides?.hiresSteps ?? parseImageParam(restParams, "Hires steps", true, true);
-    const hiresUpscaler = overrides?.hiresUpscaler ?? DEFAULTS.HIRES_UPSCALER;
+    let hiresUpscaler = parseImageParam(restParams, "Hires upscaler", false, true);
+    const isUpscaled = hiresUpscaler !== undefined;
+    hiresUpscaler = overrides?.hiresUpscaler ?? hiresUpscaler;
+
     const restoreFaces = overrides?.restoreFaces ?? !!restParams.includes("Face restoration");
     const restoreFacesStrength = overrides?.restoreFacesStrength ?? DEFAULTS.RESTORE_FACES_STRENGTH;
     const sampler = overrides?.sampler ?? parseImageParam(restParams, "Sampler", false);
@@ -499,6 +453,40 @@ const parseImageParams = async ({
     const [width, height] = parseImageParam(restParams, "Size", false)
       .split("x")
       .map((d) => +d);
+
+    /* ---------------------------- "ADetailer" Extension ---------------------------- */
+    /* ----------------- "Multi Diffusion / Tiled VAE" Extension ---------------- */
+    const aDetailer = overrides.aDetailer
+      ? {
+          ...overrides.aDetailer,
+          confidence:
+            overrides.aDetailer?.confidence ??
+            parseImageParam(restParams, "ADetailer confidence", true, true),
+          denoisingStrength:
+            overrides.aDetailer?.denoisingStrength ??
+            parseImageParam(restParams, "ADetailer denoising strength", true, true),
+          dilateErode:
+            overrides.aDetailer?.dilateErode ??
+            parseImageParam(restParams, "ADetailer dilate/erode", true, true),
+          enabled: true,
+          inpaintOnlyMasked:
+            overrides.aDetailer?.inpaintOnlyMasked ??
+            parseImageParam(restParams, "ADetailer inpaint only masked", false, true) !== "False",
+          inpaintPadding:
+            overrides.aDetailer?.inpaintPadding ??
+            parseImageParam(restParams, "ADetailer inpaint padding", true, true),
+          maskBlur:
+            overrides.aDetailer?.maskBlur ??
+            parseImageParam(restParams, "ADetailer mask blur", true, true),
+          maskOnlyTopKLargest:
+            overrides.aDetailer?.maskOnlyTopKLargest ??
+            parseImageParam(restParams, "ADetailer mask_only_top_k_largest", true, true),
+          model:
+            overrides.aDetailer.model ??
+            parseImageParam(restParams, "ADetailer model", false, true) ??
+            DEFAULTS.ADETAILER_MODEL,
+        }
+      : undefined;
 
     /* --------------------------- "Cutoff" Extension --------------------------- */
     const parseCutOffTargets = () => {
@@ -553,6 +541,7 @@ const parseImageParams = async ({
       overrides.tiledDiffusion ?? env.TILED_DIFFUSION
         ? {
             batchSize: overrides.tiledDiffusion?.batchSize ?? env.TILED_DIFFUSION.batchSize,
+            enabled: overrides.tiledDiffusion?.enabled ?? env.TILED_DIFFUSION.enabled,
             keepInputSize:
               overrides.tiledDiffusion?.keepInputSize ?? env.TILED_DIFFUSION.keepInputSize,
             method: overrides.tiledDiffusion?.method ?? env.TILED_DIFFUSION.method,
@@ -569,6 +558,7 @@ const parseImageParams = async ({
         ? {
             colorFixEnabled: overrides.tiledVAE?.colorFixEnabled ?? env.TILED_VAE.colorFixEnabled,
             decoderTileSize: overrides.tiledVAE?.decoderTileSize ?? env.TILED_VAE.decoderTileSize,
+            enabled: overrides.tiledVAE?.enabled ?? env.TILED_VAE.enabled,
             encoderTileSize: overrides.tiledVAE?.encoderTileSize ?? env.TILED_VAE.encoderTileSize,
             fastDecoderEnabled:
               overrides.tiledVAE?.fastDecoderEnabled ?? env.TILED_VAE.fastDecoderEnabled,
@@ -579,6 +569,7 @@ const parseImageParams = async ({
         : undefined;
 
     return {
+      aDetailer,
       cfgScale,
       clipSkip,
       cutoffEnabled,
@@ -594,7 +585,9 @@ const parseImageParams = async ({
       hiresScale,
       hiresSteps,
       hiresUpscaler,
+      isUpscaled,
       model,
+      modelHash,
       negPrompt,
       negTemplate,
       prompt,
@@ -613,6 +606,9 @@ const parseImageParams = async ({
       vaeHash,
     };
   } catch (err) {
+    if (err.code === "EMFILE")
+      return sleep(2000).then(() => parseImageParams({ models, overrides, paramFileName }));
+
     console.log(chalk.red(`Error parsing ${chalk.cyan(paramFileName)}: ${err.message}`));
     return undefined;
   }
@@ -635,7 +631,9 @@ const parseAndSortImageParams = async (fileNames: FileNames): Promise<ImageParam
   console.log("Parsing and sorting generation parameters...");
   const models = await listModels();
 
-  const overridesTree = await createOverridesTree(paramFileNames.map((f) => `${f}.${EXTS.PARAMS}`));
+  const overridesTree = await createOverridesTree(
+    paramFileNames.map((f) => extendFileName(f, EXTS.PARAMS))
+  );
 
   const allImageParams = (
     await Promise.all(
@@ -648,10 +646,13 @@ const parseAndSortImageParams = async (fileNames: FileNames): Promise<ImageParam
   )
     .filter((p) => !!p)
     .sort((a, b) => {
+      const modelSort = a.model.localeCompare(b.model);
+      if (modelSort !== 0) return modelSort;
+
       if (a.vaeHash && !b.vaeHash) return -1;
       if (!a.vaeHash && b.vaeHash) return 1;
       if (a.vaeHash && b.vaeHash) return a.vaeHash.localeCompare(b.vaeHash);
-      return a.model.localeCompare(b.model);
+      return 0;
     });
 
   console.log(chalk.green("Generation parameters parsed and sorted."));
@@ -687,7 +688,7 @@ const promptForBatchParams = async ({ imageFileNames }: ImageFileNames) => {
 
   const batchSize =
     +(await prompt(
-      `${chalk.blueBright("Enter batch size")} ${chalk.grey(`(${DEFAULTS.BATCH_SIZE})`)}:`
+      `${chalk.blueBright("Enter batch size")} ${chalk.grey(`(${DEFAULTS.BATCH_SIZE})`)}: `
     )) || DEFAULTS.BATCH_SIZE;
 
   const filesNotInOtherFolders =
@@ -702,8 +703,14 @@ const promptForBatchParams = async ({ imageFileNames }: ImageFileNames) => {
 };
 
 /* ---------------------------- Remap Model Name ---------------------------- */
-const remapModelName = (models: { hash: string; name: string }[], modelHash: string) =>
-  models.find((m) => m.hash === modelHash)?.name;
+const remapModelName = (models: { hash: string; name: string }[], modelHash: string) => {
+  try {
+    return models.find((m) => m.hash === modelHash)?.name;
+  } catch (err) {
+    console.warn(chalk.yellow("Missing 'models' param in remapModelName!"));
+    return undefined;
+  }
+};
 
 /* ----------------------------- Refresh Models ----------------------------- */
 const refreshModels = async () => {
@@ -738,61 +745,44 @@ export const convertImagesInCurDirToJPG = async () => {
     (fileName) => ![EXTS.IMAGE, EXTS.PARAMS].includes(path.extname(fileName).substring(1))
   );
   await convertImagesToJPG(nonJPG);
-
-  await fs.mkdir(DIR_NAMES.nonJPG);
-  await Promise.all(
-    nonJPG.map((fileName) => fs.rename(fileName, path.join(DIR_NAMES.nonJPG, fileName)))
-  );
-
+  await Promise.all(nonJPG.map((fileName) => moveFile(fileName, DIR_NAMES.NON_JPG)));
   console.log(chalk.green(`Converted ${chalk.cyan(nonJPG.length)} files to JPG.`));
   mainEmitter.emit("done");
 };
 
-/* ----------------------------- Generate Batches Exhaustively ----------------------------- */
-export const generateBatches = async ({
-  imageFileNames,
-  shuffle = false,
-  noEmit,
-}: ImageFileNames & NoEmit & { shuffle?: boolean }) => {
-  const { batchSize, filesNotInOtherFolders, folderName } = await promptForBatchParams({
-    imageFileNames,
-  });
+/* ----------------------------- Flatten Folders ---------------------------- */
+export const flattenFolders = async () => {
+  const depth = +(await prompt(chalk.blueBright("Depth: ")));
+  if (isNaN(depth)) throw new Error("Depth is not a number!");
 
-  const batches = chunkArray(
-    shuffle ? randomSort(filesNotInOtherFolders) : filesNotInOtherFolders,
-    batchSize
-  ).map((batch, i) => ({
-    fileNames: batch,
-    folderName: `[Batch] ${folderName} - ${i + 1} (${batch.length})`,
-  }));
+  const filePaths = await dirToFilePaths(".", true);
+
+  const dirPaths = filePaths.reduce((acc, cur) => {
+    const pathParts = cur.split(path.sep);
+    if (pathParts.length > depth) {
+      const targetDirPath = path.join(...pathParts.slice(0, depth));
+      const dir = acc.find((o) => o.dirPath === targetDirPath);
+      if (dir) dir.filePaths.push(cur);
+      else acc.push({ dirPath: targetDirPath, filePaths: [cur] });
+    }
+    return acc;
+  }, [] as { dirPath: string; filePaths: string[] }[]);
 
   await Promise.all(
-    batches.map(async (batch) => {
-      await fs.mkdir(batch.folderName, { recursive: true });
-
-      await Promise.all(
-        batch.fileNames.map(async (name) => {
-          try {
-            const fileName = `${name}.${EXTS.IMAGE}`;
-            await fs.copyFile(fileName, path.join(batch.folderName, path.basename(fileName)));
-            console.log(`Copied ${chalk.cyan(name)} to ${chalk.magenta(batch.folderName)}.`);
-          } catch (err) {
-            console.error(chalk.red(err));
-          }
+    dirPaths.flatMap((d) =>
+      d.filePaths.map((filePath) =>
+        moveFilesToFolder({
+          filePath,
+          folderName: d.dirPath,
+          newName: path.basename(filePath),
+          withConsole: true,
         })
-      );
-
-      console.log(
-        chalk.green(
-          `New batch of size ${chalk.cyan(batch.fileNames.length)} created at ${chalk.cyan(
-            batch.folderName
-          )}.`
-        )
-      );
-    })
+      )
+    )
   );
 
-  if (!noEmit) mainEmitter.emit("done");
+  await removeEmptyFolders();
+  mainEmitter.emit("done");
 };
 
 /* ------------------------- Generate Images (Hires Fix / Reproduce) ------------------------ */
@@ -812,9 +802,57 @@ class GenerationQueue extends PromiseQueue {
 
   progressInterval: NodeJS.Timer = null;
 
-  createTxt2ImgRequest(imageParams: ImageParams, mode: Txt2ImgMode): Txt2ImgRequest {
+  createRequest(imageParams: ImageParams) {
+    const hiresScale = imageParams.hiresScale ?? DEFAULTS.HIRES_SCALE;
+    const hiresUpscaler = imageParams.hiresUpscaler ?? DEFAULTS.HIRES_UPSCALER;
+
     return {
       alwayson_scripts: {
+        ADetailer: imageParams.aDetailer?.enabled
+          ? {
+              args: [
+                true, // enabled
+                true, // skip img2img
+                {
+                  ad_cfg_scale: imageParams.aDetailer.cfgScale ?? imageParams.cfgScale,
+                  ad_clip_skip: imageParams.aDetailer.clipSkip ?? imageParams.clipSkip,
+                  ad_confidence: imageParams.aDetailer.confidence,
+                  ad_controlnet_guidance_end: imageParams.aDetailer.controlnetGuidanceEnd,
+                  ad_controlnet_guidance_start: imageParams.aDetailer.controlnetGuidanceStart,
+                  ad_controlnet_model: imageParams.aDetailer.controlnetModel,
+                  ad_controlnet_module: imageParams.aDetailer.controlnetModule,
+                  ad_controlnet_weight: imageParams.aDetailer.controlnetWeight,
+                  ad_denoising_strength: imageParams.aDetailer.denoisingStrength,
+                  ad_dilate_erode: imageParams.aDetailer.dilateErode,
+                  ad_inpaint_height: imageParams.aDetailer.inpaintHeight,
+                  ad_inpaint_only_masked: imageParams.aDetailer.inpaintOnlyMasked,
+                  ad_inpaint_only_masked_padding: imageParams.aDetailer.inpaintPadding,
+                  ad_inpaint_width: imageParams.aDetailer.inpaintWidth,
+                  ad_mask_blur: imageParams.aDetailer.maskBlur,
+                  ad_mask_k_largest: imageParams.aDetailer.maskOnlyTopKLargest,
+                  ad_mask_max_ratio: imageParams.aDetailer.maskMaxRatio,
+                  ad_mask_merge_invert: imageParams.aDetailer.maskMergeInvert,
+                  ad_mask_min_ratio: imageParams.aDetailer.maskMinRatio,
+                  ad_model: imageParams.aDetailer.model ?? DEFAULTS.ADETAILER_MODEL,
+                  ad_negative_prompt: imageParams.aDetailer.negPrompt,
+                  ad_noise_multiplier: imageParams.aDetailer.noiseMultiplier,
+                  ad_prompt: imageParams.aDetailer.prompt,
+                  ad_restore_face: imageParams.aDetailer.restoreFace,
+                  ad_sampler: imageParams.aDetailer.sampler ?? imageParams.sampler,
+                  ad_steps:
+                    imageParams.aDetailer.steps ?? imageParams.hiresSteps ?? imageParams.steps,
+                  ad_use_cfg_scale: imageParams.aDetailer.useCfgScale,
+                  ad_use_clip_skip: imageParams.aDetailer.useClipSkip,
+                  ad_use_inpaint_width_height: imageParams.aDetailer.useInpaintWidthHeight,
+                  ad_use_noise_multiplier: imageParams.aDetailer.useNoiseMultiplier,
+                  ad_use_sampler: imageParams.aDetailer.useSampler,
+                  ad_use_steps: imageParams.aDetailer.useSteps,
+                  ad_x_offset: imageParams.aDetailer.xOffset,
+                  ad_y_offset: imageParams.aDetailer.yOffset,
+                },
+              ],
+            }
+          : undefined,
         Cutoff: imageParams.cutoffEnabled
           ? {
               args: [
@@ -829,10 +867,10 @@ class GenerationQueue extends PromiseQueue {
               ],
             }
           : undefined,
-        "Tiled Diffusion": imageParams.tiledDiffusion
+        "Tiled Diffusion": imageParams.tiledDiffusion.enabled
           ? {
               args: [
-                "True", // Tiled Diffusion enabled
+                "True", // enabled
                 imageParams.tiledDiffusion.method, // "MultiDiffusion"
                 imageParams.tiledDiffusion.overwriteSize, // "False"
                 imageParams.tiledDiffusion.keepInputSize, // "True"
@@ -842,15 +880,15 @@ class GenerationQueue extends PromiseQueue {
                 imageParams.tiledDiffusion.tileHeight, // 128
                 imageParams.tiledDiffusion.tileOverlap, // 48
                 imageParams.tiledDiffusion.batchSize, // 4
-                imageParams.hiresUpscaler,
-                imageParams.hiresScale,
+                hiresUpscaler,
+                hiresScale,
               ],
             }
           : undefined,
-        "Tiled VAE": imageParams.tiledVAE
+        "Tiled VAE": imageParams.tiledVAE.enabled
           ? {
               args: [
-                "True", // Tiled VAE enabled
+                "True", // enabled
                 imageParams.tiledVAE.encoderTileSize,
                 imageParams.tiledVAE.decoderTileSize,
                 imageParams.tiledVAE.vaeToGPU,
@@ -862,12 +900,12 @@ class GenerationQueue extends PromiseQueue {
           : undefined,
       },
       cfg_scale: imageParams.cfgScale,
-      denoising_strength: imageParams.hiresDenoisingStrength,
-      enable_hr: mode === "upscale",
+      denoising_strength: imageParams.hiresDenoisingStrength ?? DEFAULTS.HIRES_DENOISING_STRENGTH,
+      enable_hr: false,
       height: imageParams.height,
-      hr_scale: imageParams.hiresScale,
+      hr_scale: hiresScale,
       hr_steps: imageParams.hiresSteps,
-      hr_upscaler: imageParams.hiresUpscaler,
+      hr_upscaler: hiresUpscaler,
       negative_prompt: imageParams.negPrompt,
       override_settings: { CLIP_stop_at_last_layers: imageParams.clipSkip ?? 1 },
       override_settings_restore_afterwards: true,
@@ -882,6 +920,19 @@ class GenerationQueue extends PromiseQueue {
       subseed_strength: imageParams.subseedStrength ?? 0,
       width: imageParams.width,
     };
+  }
+
+  async createImg2ImgRequest(
+    imageBase64: string,
+    imageParams: ImageParams
+  ): Promise<Img2ImgRequest> {
+    const request = this.createRequest(imageParams);
+    return { ...request, init_images: [imageBase64], tiling: false };
+  }
+
+  createTxt2ImgRequest(imageParams: ImageParams, mode: Txt2ImgMode): Txt2ImgRequest {
+    const request = this.createRequest(imageParams);
+    return { ...request, enable_hr: mode === "upscale" };
   }
 
   getActiveModel() {
@@ -924,9 +975,10 @@ class GenerationQueue extends PromiseQueue {
 
   async reproduce(txt2ImgRequest: Txt2ImgRequest, imageParams: ImageParams) {
     try {
-      const { imageFileName, paramFileName } = extendFileName(imageParams.fileName);
-
       const res = await this.txt2Img(txt2ImgRequest, imageParams);
+
+      const filePath = imageParams.fileName;
+      const imageFileName = extendFileName(filePath, EXTS.IMAGE);
 
       const { percentDiff, pixelDiff } = await compareImage(imageFileName, res.imageBuffer);
       const isReproducible = percentDiff < REPROD_DIFF_TOLERANCE;
@@ -937,40 +989,77 @@ class GenerationQueue extends PromiseQueue {
         }.`
       );
 
-      const parentDir = path.join(
-        path.dirname(imageFileName),
-        isReproducible ? DIR_NAMES.reproducible : DIR_NAMES.nonReproducible
+      const prefix = `${imageParams.modelHash}-${imageParams.seed}`;
+      const folderName = path.join(
+        isReproducible ? DIR_NAMES.REPRODUCIBLE : DIR_NAMES.NON_REPRODUCIBLE,
+        prefix
       );
-      const productsDir = path.join(parentDir, DIR_NAMES.products);
-      await fs.mkdir(productsDir, { recursive: true });
+      const newName = `${prefix} - ${FILE_NAMES.REPRODUCED}`;
 
-      await Promise.all([
-        fs.writeFile(path.join(productsDir, path.basename(imageFileName)), res.imageBuffer),
-        fs.writeFile(path.join(productsDir, path.basename(paramFileName)), res.params),
-      ]);
+      await writeFilesToFolder({
+        files: [
+          { content: res.imageBuffer, ext: EXTS.IMAGE, name: newName },
+          { content: res.params, ext: EXTS.PARAMS, name: newName },
+        ],
+        folderName,
+      });
 
-      await Promise.all(
-        [imageFileName, paramFileName].map((fileName) =>
-          fs.rename(fileName, path.join(parentDir, path.basename(fileName)))
-        )
-      );
-
-      console.log(
-        `\n${chalk.cyan(imageParams.fileName)} moved to ${chalk[
-          isReproducible ? "green" : "yellow"
-        ](parentDir)}.`
-      );
+      await moveFilesToFolder({
+        exts: [EXTS.IMAGE, EXTS.PARAMS],
+        filePath,
+        folderColor: chalkColor,
+        folderName,
+        newName: `${prefix} - ${FILE_NAMES.ORIGINAL}`,
+        withConsole: true,
+      });
     } catch (err) {
       this.stopProgress();
       console.error(chalk.red(err.stack));
     }
   }
 
-  async restoreFaces(extrasRequest: ExtrasRequest, withThrow = false) {
-    const res = await API.Auto1111.post("extra-single-image", {
+  async restoreFaces({
+    imageBase64,
+    imageParams,
+    strength,
+    type,
+    withThrow = false,
+  }: {
+    imageBase64: string;
+    imageParams: ImageParams;
+    strength?: number;
+    type: RestoreFacesType;
+    withThrow?: boolean;
+  }) {
+    const isADetailer = type === RESTORE_FACES_TYPES.ADETAILER;
+    const data = isADetailer
+      ? await this.createImg2ImgRequest(imageBase64, {
+          ...imageParams,
+          aDetailer: { denoisingStrength: strength, enabled: true },
+        })
+      : ({
+          [type === RESTORE_FACES_TYPES.CODEFORMER ? "codeformer_visibility" : "gfpgan_visibility"]:
+            strength ?? DEFAULTS.RESTORE_FACES_STRENGTH,
+          image: imageBase64,
+        } as ExtrasRequest);
+
+    console.log(
+      `Restoring faces for ${chalk.cyan(imageParams.fileName)} using method ${type} with params:`,
+      chalk.cyan(
+        JSON.stringify(
+          { ...data, image: "<base64 encoded image>", init_images: ["<base64 encoded image>"] },
+          null,
+          2
+        )
+      )
+    );
+
+    this.startProgress();
+    const res = await API.Auto1111.post(isADetailer ? "img2img" : "extra-single-image", {
       headers: { "Content-Type": "application/json" },
-      data: extrasRequest,
+      data,
     });
+    this.stopProgress();
 
     if (!res.success) {
       const errorMsg = `Failed to restore faces: ${res.error}`;
@@ -981,8 +1070,8 @@ class GenerationQueue extends PromiseQueue {
       }
     }
 
-    const imageBase64: string = res.data?.image;
-    return { success: true, imageBase64 };
+    const resImageBase64: string = res.data?.images?.[0] ?? res.data?.image;
+    return { success: true, imageBase64: resImageBase64 };
   }
 
   async switchModelIfNeeded(modelName: string, models: Model[], fileName: string) {
@@ -1001,10 +1090,7 @@ class GenerationQueue extends PromiseQueue {
   async switchVAEIfNeeded(vaeHash: string, vaes: VAE[]) {
     const activeVAEHash = this.getActiveVAEHash();
     if (vaeHash !== activeVAEHash) {
-      if (
-        ["Automatic", "None"].includes(vaeHash) &&
-        !["Automatic", "None"].includes(activeVAEHash)
-      ) {
+      if (["Automatic", "None"].includes(vaeHash)) {
         console.log(`Setting active VAE to ${chalk.magenta(vaeHash)}...`);
         await setActiveVAE(vaeHash);
         this.setActiveVAEHash(vaeHash);
@@ -1045,8 +1131,10 @@ class GenerationQueue extends PromiseQueue {
 
     if (imageParams.restoreFaces) {
       const res = await this.restoreFaces({
-        codeformer_visibility: imageParams.restoreFacesStrength,
-        image: imageBase64,
+        imageBase64,
+        imageParams,
+        strength: imageParams.restoreFacesStrength,
+        type: RESTORE_FACES_TYPES.GFPGAN,
       });
       if (res.success) imageBase64 = res.imageBase64;
     }
@@ -1064,22 +1152,26 @@ class GenerationQueue extends PromiseQueue {
 
   async upscale(txt2ImgRequest: Txt2ImgRequest, imageParams: ImageParams) {
     try {
-      const outputDir = DIR_NAMES.upscaled;
-      const sourcesDir = DIR_NAMES.upscaleCompleted;
-      await Promise.all([outputDir, sourcesDir].map((dir) => fs.mkdir(dir, { recursive: true })));
-
-      const { imageFileName, paramFileName } = extendFileName(imageParams.fileName);
       const res = await this.txt2Img(txt2ImgRequest, imageParams);
-      await Promise.all([
-        fs.writeFile(path.join(outputDir, path.basename(imageFileName)), res.imageBuffer),
-        fs.writeFile(path.join(outputDir, path.basename(paramFileName)), res.params),
-      ]);
 
-      await Promise.all(
-        [imageFileName, paramFileName].map((fileName) =>
-          fs.rename(fileName, path.join(sourcesDir, path.basename(fileName)))
-        )
-      );
+      const prefix = `${imageParams.modelHash}-${imageParams.seed}`;
+      const folderName = path.join(DIR_NAMES.UPSCALED, prefix);
+      const newName = `${prefix} - ${FILE_NAMES.UPSCALED}`;
+
+      await writeFilesToFolder({
+        files: [
+          { content: res.imageBuffer, ext: EXTS.IMAGE, name: newName },
+          { content: res.params, ext: EXTS.PARAMS, name: newName },
+        ],
+        folderName,
+      });
+
+      await moveFilesToFolder({
+        exts: [EXTS.IMAGE, EXTS.PARAMS],
+        filePath: imageParams.fileName,
+        folderName,
+        newName: `${prefix} - ${FILE_NAMES.ORIGINAL}`,
+      });
     } catch (err) {
       this.stopProgress();
       console.error(chalk.red(err.stack));
@@ -1200,18 +1292,14 @@ export const generateLoraTrainingFolderAndParams = async () => {
 
   const trainingSteps = Math.ceil(Math.max(100, 1500 / imageFileNames.length));
   const imagesDirName = `input\\${trainingSteps}_${loraName}`;
-  await Promise.all(
-    [imagesDirName, "logs", "output"].map((dirName) => fs.mkdir(dirName, { recursive: true }))
-  );
+  await makeDirs([imagesDirName, "logs", "output"]);
 
   trainingParams.logging_dir = path.resolve(LORA.LOGS_DIR);
   trainingParams.output_dir = path.resolve(LORA.OUTPUT_DIR);
   trainingParams.train_data_dir = path.resolve(LORA.INPUT_DIR);
 
   await Promise.all(
-    imageFileNames.map((fileName) =>
-      fs.rename(`${fileName}.${EXTS.IMAGE}`, path.join(imagesDirName, `${fileName}.${EXTS.IMAGE}`))
-    )
+    imageFileNames.map((name) => moveFile(extendFileName(name, EXTS.IMAGE), imagesDirName))
   );
   console.log(
     `Moved ${chalk.cyan(imageFileNames.length)} images to ${chalk.magenta(imagesDirName)}.`
@@ -1280,11 +1368,47 @@ export const generateTxt2ImgOverrides = async () => {
   await booleanPrompt("Restore Faces?", "restoreFaces");
   if (overrides.restoreFaces)
     await numericalPrompt("Restore Faces Strength", "restoreFacesStrength");
+
   await numListPrompt("Sampler", "sampler", valsToOpts(samplers));
   await numericalPrompt("Enter Seed", "seed");
   await numericalPrompt("Enter Steps", "steps");
   await numericalPrompt("Enter Subseed", "subseed");
   await numericalPrompt("Enter Subseed Strength", "subseedStrength");
+
+  await booleanPrompt("ADetailer?", "aDetailer.enabled");
+  if (overrides["aDetailer.enabled"]) {
+    await numListPrompt("- Model", "aDetailer.model", valsToOpts(["face_yolov8n.pt"]));
+    await numericalPrompt("- Denoising Strength", "aDetailer.denoisingStrength");
+    await numericalPrompt("- Steps", "aDetailer.steps");
+    await numericalPrompt("- Mask K Largest", "aDetailer.maskOnlyTopKLargest");
+  }
+
+  await booleanPrompt("Tiled Diffusion?", "tiledDiffusion.enabled");
+  if (overrides["tiledDiffusion.enabled"]) {
+    await numListPrompt(
+      "- Method",
+      "tiledDiffusion.method",
+      valsToOpts(["Mixture of Diffusers", "MultiDiffusion"])
+    );
+
+    await numericalPrompt("- Batch Size", "tiledDiffusion.batchSize");
+    await numericalPrompt("- Tile Height", "tiledDiffusion.tileHeight");
+    await numericalPrompt("- Tile Width", "tiledDiffusion.tileWidth");
+    await numericalPrompt("- Tile Overlap", "tiledDiffusion.tileOverlap");
+    await booleanPrompt("- Keep Input Size?", "tiledDiffusion.keepInputSize");
+    await booleanPrompt("- Overwrite Size?", "tiledDiffusion.overwriteSize");
+  }
+
+  await booleanPrompt("Tiled VAE?", "tiledVAE.enabled");
+  if (overrides["tiledVAE.enabled"]) {
+    await numericalPrompt("- Encoder Tile Size", "tiledVAE.encoderTileSize");
+    await numericalPrompt("- Decoder Tile Size", "tiledVAE.decoderTileSize");
+    await booleanPrompt("- Color Fix Enabled?", "tiledVAE.colorFixEnabled");
+    await booleanPrompt("- Fast Encoder Enabled?", "tiledVAE.fastEncoderEnabled");
+    await booleanPrompt("- Fast Decoder Enabled?", "tiledVAE.fastDecoderEnabled");
+    await booleanPrompt("- VAE To GPU?", "tiledVAE.vaeToGPU");
+  }
+
   await numListPrompt("Upscaler", "hiresUpscaler", valsToOpts(upscalers));
   await numListPrompt(
     "VAE",
@@ -1328,14 +1452,10 @@ export const initAutomatic1111Folders = async () => {
         console.warn(chalk.yellow(`Not linking ${chalk.magenta(targetDirName)} folder.`));
       else {
         const hasSourceDir = await doesPathExist(sourceDir);
-        if (hasSourceDir)
-          await fs.rename(
-            sourceDir,
-            path.join(path.dirname(sourceDir), `__OLD__${path.basename(sourceDir)}`)
-          );
+        if (hasSourceDir) await moveFile(sourceDir, sourceDir, `${path.basename(sourceDir)} [OLD]`);
 
         const targetPath = folder || existingPath;
-        await fs.symlink(targetPath, path.join(rootDir, sourceDir), "junction");
+        await fs.symlink(targetPath, path.join(rootDir, sourceDir), "dir");
         config[folderName] = targetPath;
 
         console.log(chalk.green(`${targetDirName} folder ${existingPath ? "re-" : ""}linked.`));
@@ -1366,36 +1486,34 @@ export const initAutomatic1111Folders = async () => {
   }
 };
 
-/* ------------------- Prune Files Found in Other Folders ------------------- */
-export const pruneFilesFoundInFolders = async ({
+/* ------------------- Prune Images ------------------- */
+export const pruneImages = async ({
   imageFileNames,
+  paramFileNames,
   noEmit,
-}: ImageFileNames & NoEmit) => {
-  const otherPaths = (await prompt(chalk.blueBright("Enter folder paths to exclude: ")))
-    .replace(/^(,|\s)|(,|\s)$/g, "")
-    .split("|")
-    .map((p) => p.trim());
-
-  const imagesInOtherFolders = await getImagesInFolders({ paths: otherPaths });
-
-  const imagesInCurFolderAndOtherFolders = listImagesFoundInOtherFolders({
-    imageFileNames,
-    imagesInOtherFolders,
-  });
-
-  const targetDir = DIR_NAMES.prunedImagesOtherFolders;
-  await fs.mkdir(targetDir, { recursive: true });
+}: FileNames & NoEmit) => {
+  const unusedImages: string[] = [];
 
   await Promise.all(
-    imagesInCurFolderAndOtherFolders.map(async (img) => {
-      const fileName = `${img.name}.${img.ext}`;
-      await fs.rename(fileName, path.join(targetDir, fileName));
-      console.log(`Pruned ${chalk.yellow(fileName)}.`);
+    imageFileNames.map(async (img) => {
+      if (paramFileNames.find((p) => p === img)) return;
+
+      await moveFilesToFolder({
+        filePath: img,
+        folderColor: "yellow",
+        folderName: DIR_NAMES.PRUNED_IMAGES,
+        exts: [EXTS.IMAGE],
+        withConsole: true,
+      });
+
+      unusedImages.push(img);
     })
   );
 
-  console.log(chalk.green("All images found in other folders pruned."));
+  console.log(`${chalk.yellow(unusedImages.length)} unused images pruned.`);
   if (!noEmit) mainEmitter.emit("done");
+
+  return unusedImages;
 };
 
 /* ------------------- Prune Generation Parameters ------------------- */
@@ -1405,18 +1523,20 @@ export const pruneImageParams = async ({
   paramFileNames,
 }: FileNames & NoEmit) => {
   const unusedParams: string[] = [];
-  const dirName = DIR_NAMES.prunedParams;
-  await fs.mkdir(dirName, { recursive: true });
 
   await Promise.all(
     paramFileNames.map(async (p) => {
-      const image = imageFileNames.find((i) => i === p);
-      if (!image) {
-        const fileName = `${p}.${EXTS.PARAMS}`;
-        await fs.rename(fileName, path.join(dirName, path.basename(fileName)));
-        unusedParams.push(p);
-        console.log(`${chalk.yellow(fileName)} pruned.`);
-      }
+      if (imageFileNames.find((img) => img === p)) return;
+
+      await moveFilesToFolder({
+        filePath: p,
+        folderColor: "yellow",
+        folderName: DIR_NAMES.PRUNED_PARAMS,
+        exts: [EXTS.PARAMS],
+        withConsole: true,
+      });
+
+      unusedParams.push(p);
     })
   );
 
@@ -1426,35 +1546,55 @@ export const pruneImageParams = async ({
   return unusedParams;
 };
 
-/* ------------ Prune Generation Parameters & Segment by Upscaled ----------- */
-export const pruneParamsAndSegmentUpscaled = async (fileNames: FileNames) => {
-  try {
-    const prunedParams = await pruneImageParams({ ...fileNames, noEmit: true });
-    const filteredParamNames = fileNames.paramFileNames.filter((p) => !prunedParams.includes(p));
-    await segmentByUpscaled({ paramFileNames: filteredParamNames, noEmit: true });
-  } catch (err) {
-    console.error(chalk.red(err));
-  } finally {
-    mainEmitter.emit("done");
-  }
+/* -------------------------- Remove Empty Folders -------------------------- */
+export const removeEmptyFoldersAction = async () => {
+  await removeEmptyFolders();
+  mainEmitter.emit("done");
 };
 
+/* ------------------------------ Restore Faces ----------------------------- */
 export const restoreFaces = async ({ imageFileNames }: ImageFileNames) => {
   try {
     const perfStart = performance.now();
 
     let completedCount = 0;
     let errorCount = 0;
-    const totalCount = imageFileNames.length;
-    if (totalCount === 0) mainEmitter.emit("done");
+
+    const fileNames = imageFileNames.reduce((acc, cur) => {
+      const [modelHash, seed] = path.basename(cur, path.extname(cur)).split("-");
+      const existing = acc.find((f) => {
+        const [fModelHash, fSeed] = path.basename(f, path.extname(f)).split("-");
+        return fModelHash === modelHash && fSeed === seed;
+      });
+
+      if (!existing) acc.push(cur);
+      else if (cur.includes(FILE_NAMES.UPSCALED)) acc[acc.indexOf(existing)] = cur;
+      return acc;
+    }, [] as string[]);
+
+    const totalCount = fileNames.length;
+    if (totalCount === 0) return mainEmitter.emit("done");
+
+    const types = Object.values(RESTORE_FACES_TYPES) as RestoreFacesType[];
+    const typeIndex = +(await prompt(
+      `${chalk.blueBright("Select method: ")}\n${makeConsoleList(types, true)}\n`
+    ));
+    const type = types[typeIndex - 1];
 
     const overridesTree = await createOverridesTree(
-      imageFileNames.map((f) => `${f}.${EXTS.IMAGE}`)
+      fileNames.map((f) => extendFileName(f, EXTS.IMAGE))
     );
+
+    const models = await listModels();
 
     overridesTree.forEach(({ filePaths, overrides }) =>
       filePaths.forEach((filePath) => {
-        const fileName = path.basename(filePath, `.${EXTS.IMAGE}`);
+        const fileName = path.join(
+          path.dirname(filePath),
+          path.basename(filePath, path.extname(filePath))
+        );
+        const imageFileName = extendFileName(fileName, EXTS.IMAGE);
+        const paramFileName = extendFileName(fileName, EXTS.PARAMS);
 
         GenQueue.add(async () => {
           const iterationPerfStart = performance.now();
@@ -1480,23 +1620,30 @@ export const restoreFaces = async ({ imageFileNames }: ImageFileNames) => {
           };
 
           try {
-            console.log(`Restoring faces for ${chalk.cyan(fileName)}...`);
+            const imageParams = await parseImageParams({ models, overrides, paramFileName });
 
-            const image = await fs.readFile(`${fileName}.${EXTS.IMAGE}`, { encoding: "base64" });
             const res = await GenQueue.restoreFaces({
-              codeformer_visibility:
-                overrides.restoreFacesStrength ?? DEFAULTS.RESTORE_FACES_STRENGTH,
-              image,
+              imageBase64: await fs.readFile(imageFileName, { encoding: "base64" }),
+              imageParams,
+              strength: overrides.restoreFacesStrength,
+              type,
             });
 
             if (!res.success) {
               errorCount++;
               throw new Error(res.error);
             } else {
-              const name = path.basename(`${fileName}.${EXTS.IMAGE}`);
-              const filePath = path.join(DIR_NAMES.restoredFaces, name);
-              await fs.mkdir(path.dirname(filePath), { recursive: true });
-              await fs.writeFile(filePath, Buffer.from(res.imageBase64, "base64"));
+              const prefix = `${imageParams.modelHash}-${imageParams.seed}`;
+              const name = `${prefix} - ${FILE_NAMES.RESTORED_FACES} (${type})`;
+
+              const paramsContent = await fs.readFile(extendFileName(imageFileName, EXTS.PARAMS));
+              await writeFilesToFolder({
+                files: [
+                  { content: Buffer.from(res.imageBase64, "base64"), ext: EXTS.IMAGE, name },
+                  { content: paramsContent, ext: EXTS.PARAMS, name },
+                ],
+                folderName: DIR_NAMES.RESTORED_FACES,
+              });
 
               completedCount++;
               handleCompletion();
@@ -1511,33 +1658,147 @@ export const restoreFaces = async ({ imageFileNames }: ImageFileNames) => {
     );
   } catch (err) {
     console.error(chalk.red(err.stack));
+    mainEmitter.emit("done");
   }
 };
 
-/* -------------------------- Segment by Dimensions ------------------------- */
-export const segmentByDimensions = async ({ imageFileNames, noEmit }: ImageFileNames & NoEmit) => {
-  console.log("Segmenting by dimensions...");
+/* ----------------------------- Segment by Batches ----------------------------- */
+export const segmentByBatches = async ({
+  imageFileNames,
+  shuffle = false,
+  noEmit,
+}: ImageFileNames & NoEmit & { shuffle?: boolean }) => {
+  const { batchSize, filesNotInOtherFolders, folderName } = await promptForBatchParams({
+    imageFileNames,
+  });
+
+  const batches = chunkArray(
+    shuffle ? randomSort(filesNotInOtherFolders) : filesNotInOtherFolders,
+    batchSize
+  ).map((batch, i) => ({
+    fileNames: batch,
+    folderName: `[Batch - ${i + 1}] ${folderName ? `${folderName} ` : ""}(${batch.length})`,
+  }));
 
   await Promise.all(
-    imageFileNames.map(async (name) => {
+    batches.map(async (batch) => {
+      await makeDirs([batch.folderName]);
+
+      await Promise.all(
+        batch.fileNames.map(async (name) => {
+          await moveFilesToFolder({
+            exts: [EXTS.IMAGE, EXTS.PARAMS],
+            filePath: name,
+            folderName: batch.folderName,
+            withConsole: true,
+          });
+        })
+      );
+
+      console.log(
+        chalk.green(
+          `New batch of size ${chalk.cyan(batch.fileNames.length)} created at ${chalk.cyan(
+            batch.folderName
+          )}.`
+        )
+      );
+    })
+  );
+
+  await removeEmptyFolders();
+  if (!noEmit) mainEmitter.emit("done");
+};
+
+/* -------------------------- Segment by Dimensions ------------------------- */
+export const segmentByDimensions = async ({
+  imageFileNames,
+  paramFileNames,
+  noEmit,
+}: FileNames & NoEmit) => {
+  const res = (await prompt(
+    chalk.blueBright(
+      `Use file dimensions instead of original size? (y/n) ${makeExistingValueLog("n")}`
+    )
+  )) as "y" | "n";
+  const shouldUseFileDimensions = res === "y";
+
+  console.log("Segmenting by dimensions...");
+
+  const moveToDimFolder = async ({ height, name, width }) =>
+    await moveFilesToFolder({
+      filePath: name,
+      folderName: `${height} x ${width}`,
+      exts: [EXTS.IMAGE, EXTS.PARAMS],
+      withConsole: true,
+    });
+
+  if (shouldUseFileDimensions) {
+    await Promise.all(
+      imageFileNames.map(async (name) => {
+        try {
+          const fileName = extendFileName(name, EXTS.IMAGE);
+          const { height, width } = await sharp(fileName).metadata();
+          await moveToDimFolder({ height, name, width });
+        } catch (err) {
+          console.error(chalk.red("Error segmenting file by dimensions: ", err.stack));
+        }
+      })
+    );
+  } else {
+    const allImageParams = await parseAndSortImageParams({ imageFileNames, paramFileNames });
+
+    await Promise.all(
+      allImageParams.map(async (params) => {
+        try {
+          const { height, width } = params;
+          await moveToDimFolder({ height, name: params.fileName, width });
+        } catch (err) {
+          console.error(chalk.red("Error segmenting file by dimensions: ", err.stack));
+        }
+      })
+    );
+  }
+
+  await removeEmptyFolders();
+
+  console.log(chalk.cyan(imageFileNames.length), chalk.green(" files segmented by dimensions."));
+  if (!noEmit) mainEmitter.emit("done");
+};
+
+/* --------------------------- Segment by Filename -------------------------- */
+export const segmentByFilename = async ({
+  imageFileNames,
+  paramFileNames,
+  noEmit,
+}: FileNames & NoEmit) => {
+  console.log("Segmenting by filename...");
+
+  const allImageParams = await parseAndSortImageParams({ imageFileNames, paramFileNames });
+
+  await Promise.all(
+    allImageParams.map(async (params) => {
       try {
-        const { height, width } = await sharp(`${name}.${EXTS.IMAGE}`).metadata();
-        const folderName = `${height} x ${width}`;
+        const filePath = params.fileName;
+        const fileName = path.basename(filePath, path.extname(filePath));
 
         await moveFilesToFolder({
-          filePath: name,
-          folderName,
           exts: [EXTS.IMAGE, EXTS.PARAMS],
+          filePath,
+          folderName: fileName,
+          newName: Object.values(FILE_NAMES).includes(fileName)
+            ? undefined
+            : `${fileName} - ${params.isUpscaled ? FILE_NAMES.UPSCALED : FILE_NAMES.ORIGINAL}`,
+          withConsole: true,
         });
       } catch (err) {
-        console.error(chalk.red("Error segmenting file by dimensions: ", err.stack));
+        console.error(chalk.red("Error segmenting file by filename: ", err.stack));
       }
     })
   );
 
   await removeEmptyFolders();
 
-  console.log(chalk.cyan(imageFileNames.length), chalk.green(" files segmented by dimensions."));
+  console.log(chalk.cyan(imageFileNames.length), chalk.green(" files segmented by filename."));
   if (!noEmit) mainEmitter.emit("done");
 };
 
@@ -1593,6 +1854,7 @@ export const segmentByKeywords = async ({
             filePath: imageParams.fileName,
             folderName: `${reqAll}${reqAll && reqAny ? " - " : ""}${reqAny}`,
             exts: [EXTS.IMAGE, EXTS.PARAMS],
+            withConsole: true,
           });
 
           segmentedCount++;
@@ -1625,6 +1887,7 @@ export const segmentByModel = async ({
         filePath: fileName,
         folderName: model,
         exts: [EXTS.IMAGE, EXTS.PARAMS],
+        withConsole: true,
       });
     })
   );
@@ -1632,6 +1895,54 @@ export const segmentByModel = async ({
   await removeEmptyFolders();
 
   console.log(chalk.cyan(allImageParams.length), chalk.green(" files segmented by model."));
+  if (!noEmit) mainEmitter.emit("done");
+};
+
+/* --------------------------- Segment by ModelHash-Seed -------------------------- */
+export const segmentByModelHashSeed = async ({
+  imageFileNames,
+  paramFileNames,
+  noEmit,
+}: FileNames & NoEmit) => {
+  console.log("Renaming to [ModelHash]-[Seed]...");
+
+  const allImageParams = await parseAndSortImageParams({ imageFileNames, paramFileNames });
+  const suffixRegEx = new RegExp(
+    `((?:${Object.values(FILE_NAMES).join("|")})((?:\\s\\((?:${Object.values(
+      RESTORE_FACES_TYPES
+    ).join("|")})\\))?(?:\\s\\(\\d+\\))?))(?:\\.\\w+)?$`
+  );
+
+  await Promise.all(
+    allImageParams.map(async (params) => {
+      try {
+        const filePath = params.fileName;
+        const fileName = path.basename(filePath, path.extname(filePath));
+        const prefix = `${params.modelHash}-${params.seed}`;
+        const suffix =
+          fileName.match(suffixRegEx)?.[1] ??
+          (params.isUpscaled ? FILE_NAMES.UPSCALED : FILE_NAMES.ORIGINAL);
+        const newName = `${prefix} - ${suffix}`;
+
+        await moveFilesToFolder({
+          exts: [EXTS.IMAGE, EXTS.PARAMS],
+          filePath,
+          folderName: prefix,
+          newName,
+          withConsole: true,
+        });
+      } catch (err) {
+        console.error(chalk.red("Error renaming files: ", err.stack));
+      }
+    })
+  );
+
+  await removeEmptyFolders();
+
+  console.log(
+    chalk.cyan(imageFileNames.length + paramFileNames.length),
+    chalk.green(" files renamed.")
+  );
   if (!noEmit) mainEmitter.emit("done");
 };
 
@@ -1646,7 +1957,7 @@ export const segmentByUpscaled = async ({ paramFileNames, noEmit }: ParamFileNam
     paramFileNames.map(async (fileName) => {
       const imageParams = await fs.readFile(`${fileName}.${EXTS.PARAMS}`);
       const isUpscaled = imageParams.includes("Hires upscaler");
-      const folderName = isUpscaled ? DIR_NAMES.upscaled : DIR_NAMES.nonUpscaled;
+      const folderName = isUpscaled ? DIR_NAMES.UPSCALED : DIR_NAMES.NON_UPSCALED;
       isUpscaled ? upscaledCount++ : nonUpscaledCount++;
 
       await moveFilesToFolder({
@@ -1654,6 +1965,7 @@ export const segmentByUpscaled = async ({ paramFileNames, noEmit }: ParamFileNam
         folderName,
         filePath: fileName,
         exts: [EXTS.IMAGE, EXTS.PARAMS],
+        withConsole: true,
       });
     })
   );

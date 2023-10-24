@@ -1,3 +1,6 @@
+import { DEFAULTS_BASE, DIR_NAMES_BASE } from "./constants";
+import { NestedKeyOf } from "./utils";
+
 export type ImageFileNames = { imageFileNames: string[] };
 export type ParamFileNames = { paramFileNames: string[] };
 export type FileNames = ImageFileNames & ParamFileNames;
@@ -13,6 +16,10 @@ export type Auto1111FolderConfig = {
   vae?: string;
 };
 export type Auto1111FolderName = keyof Auto1111FolderConfig;
+
+export type Defaults = typeof DEFAULTS_BASE;
+
+export type DirNames = typeof DIR_NAMES_BASE;
 
 export type ExtrasRequest = {
   codeformer_visibility?: number;
@@ -32,6 +39,43 @@ export type ExtrasRequest = {
 };
 
 export type ImageParams = {
+  aDetailer?: {
+    cfgScale?: number;
+    clipSkip?: number;
+    confidence?: number;
+    controlnetGuidanceEnd?: number;
+    controlnetGuidanceStart?: number;
+    controlnetModel?: string;
+    controlnetModule?: string;
+    controlnetWeight?: number;
+    denoisingStrength?: number;
+    dilateErode?: number;
+    enabled?: boolean;
+    inpaintHeight?: number;
+    inpaintOnlyMasked?: boolean;
+    inpaintPadding?: number;
+    inpaintWidth?: number;
+    maskBlur?: number;
+    maskMaxRatio?: number;
+    maskMergeInvert?: string;
+    maskMinRatio?: number;
+    maskOnlyTopKLargest?: number;
+    model?: string;
+    negPrompt?: string;
+    noiseMultiplier?: number;
+    prompt?: string;
+    restoreFace?: boolean;
+    sampler?: string;
+    steps?: number;
+    useCfgScale?: boolean;
+    useClipSkip?: boolean;
+    useInpaintWidthHeight?: boolean;
+    useNoiseMultiplier?: boolean;
+    useSampler?: boolean;
+    useSteps?: boolean;
+    xOffset?: number;
+    yOffset?: number;
+  };
   cfgScale?: number;
   clipSkip?: number;
   cutoffDisableForNeg?: boolean;
@@ -47,7 +91,9 @@ export type ImageParams = {
   hiresScale?: number;
   hiresSteps?: number;
   hiresUpscaler?: string;
+  isUpscaled?: boolean;
   model?: string;
+  modelHash?: string;
   negPrompt?: string;
   negTemplate?: string;
   prompt?: string;
@@ -62,6 +108,7 @@ export type ImageParams = {
   template?: string;
   tiledDiffusion?: {
     batchSize: number;
+    enabled: boolean;
     keepInputSize: "True" | "False";
     method: "MultiDiffusion" | "Mixture of Diffusers";
     overwriteSize: "True" | "False";
@@ -72,6 +119,7 @@ export type ImageParams = {
   tiledVAE?: {
     colorFixEnabled: "True" | "False";
     decoderTileSize: number;
+    enabled: boolean;
     encoderTileSize: number;
     fastDecoderEnabled: "True" | "False";
     fastEncoderEnabled: "True" | "False";
@@ -81,8 +129,8 @@ export type ImageParams = {
   vaeHash?: string;
   width?: number;
 };
-export type Txt2ImgOverrides = Omit<ImageParams, "fileName" | "rawParams" | "vaeHash">;
-export type Txt2ImgOverride = keyof Txt2ImgOverrides;
+
+export type Img2ImgRequest = Txt2ImgRequest & { init_images: string[]; tiling: boolean };
 
 export type LoraTrainingParams = {
   cache_latents?: boolean;
@@ -149,6 +197,10 @@ export type Txt2ImgOverrideGroup = {
   fileNames: string[];
   overrides?: Txt2ImgOverrides;
 };
+
+export type Txt2ImgOverrides = Omit<ImageParams, "fileName" | "rawParams" | "vaeHash">;
+
+export type Txt2ImgOverride = NestedKeyOf<Txt2ImgOverrides>;
 
 export type Txt2ImgRequest = {
   alwayson_scripts?: object;
